@@ -538,6 +538,8 @@ mod test {
                 treasury.clone(),
                 resolver_id.clone(),
                 100u32,
+                // Protocol keeps the whole fee; resolver tests do no splits.
+                10_000u32,
             ),
         );
         let market_core = MarketCoreClient::new(&env, &market_core_id);
