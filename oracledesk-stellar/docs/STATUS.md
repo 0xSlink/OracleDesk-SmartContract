@@ -1,8 +1,26 @@
 # Status
 
-Last updated: 2026-09-21. This is the honest account of what works, what's
+Last updated: 2026-09-21 (contributor addendum 2026-10-16 — see the first
+section after this intro). This is the honest account of what works, what's
 unverified, and what's left. Everything marked "verified" was demonstrated
 with real command output in the session that wrote this file, not asserted.
+
+## Contributor addendum: 2026-10-16
+
+Fee split + recipient snapshot (#8), per-market circuit breakers (#10),
+trade deadlines and limit prices (#12), and transferable positions/LP plus
+treasury migration (#13) are implemented on
+`feat/fees-breakers-bounds-and-transfers` (PR against `develop`; design
+notes in `docs/architecture.md`). Verified in the contributor session:
+`cargo fmt --check`, `cargo clippy --workspace --all-targets -- -D warnings`
+and `cargo test --workspace` (now **87** tests: market-core 54, resolver 6,
+reasoning-registry 6, treasury 21 — superseding the 40-test count below),
+`python3 model/fpmm_model.py`, agents (36 tests) and x402 (5 tests) with the
+regenerated bindings, `make build` and `make bindings` with only the
+intended diffs. **Not** (re)verified: no testnet redeploy — the deployed
+contracts and `deployments/testnet.json` predate these changes, so the new
+entrypoints have contract-level and off-chain tests only, not a real-ledger
+transaction.
 
 ## Phase 0: recon and safety
 
