@@ -98,7 +98,7 @@ ownership can change hands at any point via `transfer_position` /
 
 ### resolver
 
-Two independent resolution modes, both ultimately calling
+Independent resolution modes, all ultimately calling
 `market_core.resolve(market_id, outcome)`:
 
 - **PriceThreshold**: reads a [Reflector](https://reflector.network) SEP-40
@@ -107,11 +107,57 @@ Two independent resolution modes, both ultimately calling
 - **Attested**: m-of-n signer votes; once `threshold` signers agree, a
   dispute window opens; anyone can finalize after it elapses, or a guardian
   (the resolver's `admin`) can `cancel_proposal` during the window.
+- **Weighted keys**: a committee of raw Ed25519 public keys with weights.
+  Members sign a domain-separated message off-chain and anyone submits the
+  signatures to `submit_signatures` in one transaction; the weight threshold
+  starts the same dispute window. `cancel_proposal` moves the market to a new
+  round, invalidating earlier signatures. Message format: ADR 0001.
 
 Neither mode can be configured until the revealed spec's hash matches the
 market's commitment (`register_price_spec` / `register_signer_spec` — see
 ADR 0001). A guardian can also `guardian_void_market` an unresolvable
 market directly.
+
+#### Bonded disputes (`SignersDisputable`)
+
+A `SignersDisputable` spec adds an optimistic challenge to Attested mode.
+While a proposal's dispute window is open, anyone can `dispute` it by
+escrowing `dispute_bond` of the collateral token in the resolver. That
+freezes `finalize_signers`, `attest`, `cancel_proposal` and `expire_market`
+(`DisputeActive`) and escalates to the authority committed in the spec: the
+guardian (`settle_dispute`) or a `k`-of-`n` committee disjoint from the
+signers (`escalation_attest`). Upholding the proposal resolves to it and
+forfeits the bond to market-core's treasury; any other ruling resolves to the
+verdict (or voids for `Invalid`) and returns the bond. If nobody rules within
+`escalation_timeout` of the dispute, anyone may `expire_dispute`: the market is
+voided and the bond refunded. `guardian_void_market` during a dispute also
+refunds it. Bonds leave escrow only via the permissionless
+`claim_dispute_bond` (pull, so a payee that cannot receive cannot block
+settlement); the resolver's token balance always equals the bonds it still
+holds.
+
+```mermaid
+stateDiagram-v2
+    [*] --> SignersPending: register_disputable_spec
+    SignersPending --> SignersPending: attest (proposal at threshold)
+    SignersPending --> Finalized: finalize_signers (window elapsed)
+    SignersPending --> Disputed: dispute (window open, bond escrowed)
+    Disputed --> Finalized: settle_dispute / escalation_attest (k votes)
+    Disputed --> Finalized: expire_dispute (timeout, void, refund)
+    Disputed --> Finalized: guardian_void_market (void, refund)
+    SignersPending --> Expired: expire_market (no pending proposal)
+    Finalized --> [*]: claim_dispute_bond pays the payee
+```
+
+**Rewards, honestly:** a winning disputer only gets their bond back. The
+resolver holds no funds besides bonds, so there is nothing to pay a reward
+from until signers also post bonds (signer staking is separate work). The
+incentive to dispute is therefore protecting one's own position, not profit.
+
+Liveness: `resolution_deadline` is `close_time` + 30 days. After it anyone can
+call `expire_market`, which resolves the market if it still can be (valid
+price feed) and otherwise voids it through market-core, so collateral is never
+locked behind a missing reveal or a silent committee. See ADR 0001.
 
 The resolver never depends on `market-core`'s Rust crate — see
 [ADR 0002](adr/0002-cross-contract-calls.md) for why, and what that trades
