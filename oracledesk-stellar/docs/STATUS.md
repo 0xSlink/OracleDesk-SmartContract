@@ -206,6 +206,11 @@ markers in the files themselves:
   independent agent deployments from trading against the same
   `market-core` markets. The treasury's caps bound one deployment's own
   risk, not systemic market behavior.
+- **Expiry cannot help an oracle the creator controls.** `expire_market`
+  voids unresolvable markets 30 days after close, but a creator who commits
+  to a feed they control can still decide the outcome of a *resolvable*
+  price market; the commitment does not bind oracle identity (ADR 0001,
+  "Liveness fallback").
 - **Single admin key per contract**, no multisig/timelock. A compromised
   admin key has a large blast radius per contract (see
   `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md`, which
