@@ -29,6 +29,22 @@ The work above landed on `develop` as merge commit `581a3ec` (PR #153,
 merged 2026-10-16), so the feature-branch reference above is historical and
 `develop` is the source of truth for #8, #10, #12 and #13.
 
+## Contributor addendum: 2026-10-18
+
+Signer-key rotation via committee registry (#35), hybrid price feed with attested
+fallback (#36), attestation evidence linking to reasoning-registry (#34), and
+constrained guardian powers with time windows and audit logs (#33) are implemented
+on `feat/resolver-committee-hybrid-evidence-guardian`.
+Key additions:
+- Resolver contract: `create_committee`, `propose_rotation`, `execute_rotation`,
+  `cancel_rotation`, `register_committee_spec`, `register_hybrid_spec`, `open_fallback`,
+  `attest_with_evidence`, `set_evidence_config`, and constrained `cancel_proposal`
+  and `guardian_void_market` with `GuardianReason`.
+- Spec-hash CLI: Added `committee` and `hybrid` spec hashing commands.
+- Reasoning registry wasm vendored into `contracts/resolver/reasoning_registry.wasm`
+  for cross-contract client generation in Soroban.
+- Documentation, architecture, ADRs, and security policy updated accordingly.
+
 ## Phase 0: recon and safety
 
 **Toolchain** (as installed in the environment this was built in):

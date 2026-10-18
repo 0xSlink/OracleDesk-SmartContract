@@ -112,11 +112,23 @@ Independent resolution modes, all ultimately calling
   signatures to `submit_signatures` in one transaction; the weight threshold
   starts the same dispute window. `cancel_proposal` moves the market to a new
   round, invalidating earlier signatures. Message format: ADR 0001.
+- **Committee with time-locked key rotation** (#35): binds resolution to a
+  reusable committee registry rather than raw addresses. The admin can propose
+  membership and threshold rotations with a mandatory delay (`rotation_delay >= 86_400`).
+  Markets commit to `(committee_id, min_epoch, max_rotation_delta, dispute_window)`.
+  Votes are checked and recounted against the committee members active at the current epoch.
+- **Hybrid (price feed with attested fallback)** (#36): commits to a Reflector
+  price rule and a fallback signer set. If the oracle feed fails or is unavailable
+  after `close_time + fallback_delay`, anyone can call `open_fallback(market_id)` to
+  allow fallback signers to propose and attest. If a valid price report arrives before
+  the fallback dispute window closes, `resolve_price` immediately supersedes the proposal
+  and resolves the market.
 
-Neither mode can be configured until the revealed spec's hash matches the
-market's commitment (`register_price_spec` / `register_signer_spec` — see
-ADR 0001). A guardian can also `guardian_void_market` an unresolvable
-market directly.
+None of these modes can be configured until the revealed spec's hash matches the
+market's commitment (`register_price_spec`, `register_signer_spec`,
+`register_committee_spec`, or `register_hybrid_spec` — see ADR 0001).
+A guardian can also `guardian_void_market` an unresolvable market directly,
+subject to time windows and typed audit reasons.
 
 #### Bonded disputes (`SignersDisputable`)
 
@@ -158,6 +170,30 @@ Liveness: `resolution_deadline` is `close_time` + 30 days. After it anyone can
 call `expire_market`, which resolves the market if it still can be (valid
 price feed) and otherwise voids it through market-core, so collateral is never
 locked behind a missing reveal or a silent committee. See ADR 0001.
+
+#### Attestation evidence linking (`reasoning-registry`)
+
+Attestation votes can be bound to cryptographic traces recorded in `reasoning-registry`.
+When configured via `set_evidence_config(min_policy, registry)`:
+- Signers call `attest_with_evidence` citing `(trace_hash, reasoning_hash)`.
+- The resolver queries `reasoning-registry` via cross-contract call to confirm that
+  the trace has been published and satisfies `EvidencePolicy` (e.g. `RawBytes` vs `ReasoningBounded`).
+- Each `trace_hash` can only be cited once per market (`EvidenceUsed` prevents replay).
+- An audit trail of cited traces is preserved on-chain (`evidence_count`, `evidence_at`).
+
+#### Constrained guardian powers and audit trail
+
+To limit administrative discretion:
+- **Dispute window bounds**: `cancel_proposal` can only be executed while a dispute window
+  is actively open (`DisputeWindowClosed` error if closed).
+- **Grace periods for voiding**: `guardian_void_market` cannot void arbitrarily; it requires
+  `close_time + REVEAL_GRACE_SECS` (3 days) for unrevealed specs, `close_time + ORACLE_GRACE_SECS`
+  (1 day) for failing price feeds, and `close_time + SIGNER_GRACE_SECS` (7 days) for unresponsive
+  signers (`GracePeriodNotElapsed` error if called early).
+- **Rate limiting**: `MAX_CANCELS_PER_MARKET = 2` prevents infinite cancellation griefing.
+- **Audit trail**: Every guardian cancellation or void requires a typed `GuardianReason`
+  (`StaleOracleFeed`, `CompromisedSigner`, `AmbiguousSpec`, `LivenessFailure`, `Other`),
+  and emits a `GuardianAction` event with full contextual metadata.
 
 The resolver never depends on `market-core`'s Rust crate — see
 [ADR 0002](adr/0002-cross-contract-calls.md) for why, and what that trades
