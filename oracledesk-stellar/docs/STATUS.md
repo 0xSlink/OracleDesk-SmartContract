@@ -252,10 +252,23 @@ markers in the files themselves:
   to a feed they control can still decide the outcome of a *resolvable*
   price market; the commitment does not bind oracle identity (ADR 0001,
   "Liveness fallback").
-- **Single admin key per contract**, no multisig/timelock. A compromised
-  admin key has a large blast radius per contract (see
+- **Single admin key per contract**, no multisig. A compromised admin key
+  has a large blast radius per contract (see
   `docs/wave-issues/12-architecture-deep-dive-and-threat-model.md`, which
-  proposes writing this up formally — not yet done).
+  proposes writing this up formally — not yet done). The treasury's
+  config, price policy and agent registry are timelocked (loosening waits
+  `config_delay`, tightening is immediate), which bounds what a compromised
+  admin can unlock for the *agents*; it does not cover `set_paused`,
+  `set_successor` + `migrate_market` (which moves positions out of the
+  vault), or any other contract's admin.
+- **Treasury vault NAV is conservative, not mark-to-market.** Directional
+  exposure in open markets counts as zero, so deposits are slightly cheap
+  and withdrawals slightly expensive while positions are open; positions
+  opened before a lazy migration from the pre-vault layout, or received by
+  a successor treasury via `migrate_market`, are not in the open-market
+  index and count as zero until redeemed. See
+  `docs/adr/0005-treasury-vault.md` for the residual risks (LP floor moved by
+  rebalancing trades, fees swept just after a deposit).
 - **`treasury`'s per-market cap is cumulative and never decreases** (even
   after `close_trade`) — this is the existing, intentional design (a
   lifetime cap on capital ever committed to one market), documented in

@@ -250,14 +250,37 @@ off.
 
 Holds the agents' pooled USDC and is the *only* path that spends it: an
 agent calls `agent_create_market` / `agent_buy` / `agent_sell` /
-`agent_buy_v2` / `agent_sell_v2`, the treasury checks its own
-per-trade/per-market/daily caps, then calls `market-core` itself as the
-trader/creator. This means the caps are a real on-chain limit on what the
+`agent_buy_v2` / `agent_sell_v2` (always naming itself as the first
+`agent` argument), the treasury checks the agent's role and its own
+per-trade/per-market/daily caps plus the price limits, then calls
+`market-core` itself as the trader/creator. This means the caps are a real on-chain limit on what the
 automated agent can deploy — an agent's own key calling `market-core`
 directly would just be trading its own separate funds, not bypassing a cap
 on the treasury's money. The `*_v2` twins forward the same caps plus
 market-core's deadline / limit-price bounds, so a revert from either layer
 leaves the caps unchanged (the whole invocation is atomic).
+
+**Agents.** The treasury keeps a registry of up to `MAX_AGENTS = 16` agents,
+each with an `AgentPolicy { roles, max_trade, max_daily, active }`. Roles are
+a bitmask: `ROLE_CREATE` (`agent_create_market`), `ROLE_TRADE` (`agent_buy`,
+`agent_sell` and their `_v2` twins) and `ROLE_SETTLE` (`redeem`,
+`claim_pool_remainder`, `close_trade`, `agent_claim_lp_fees`, the `legacy_*`
+recovery calls). The constructor registers its `agent` with every role and
+the global caps; `scripts/deploy-testnet.sh` then proposes a separate maker
+(`CREATE | SETTLE`) and trader (`TRADE | SETTLE`), so a leaked trader key
+cannot create markets and a runaway trader cannot spend the maker's budget.
+An agent's `max_trade` and `max_daily` sit under the global caps; both levels
+are checked on every spend, and each agent has its own sliding daily window
+(`agent_daily_usage`). `TradeAuthorized.agent` names the acting agent.
+Positions are still pooled: market-core only ever sees the treasury, so the
+per-agent state is usage, not ownership. `remove_agent` deactivates at once
+(usage history kept), but at least one active `ROLE_SETTLE` agent must always
+remain so open positions can be settled. Narrowing an active agent's policy
+applies at once; adding, reactivating or widening one goes through the
+timelock below (`set_agent` → `execute_agent` after `config_delay`).
+`get_config()` survives as a deprecated view in the old `RiskConfig` shape,
+whose `agent` is the first registered agent; a stored pre-registry config is
+migrated lazily into `GlobalConfig` plus one full-role agent.
 
 **Caps.** Four limits apply to every buy and market creation:
 
@@ -293,9 +316,81 @@ creator-side claims are split the same way the fees are: `collect_market_fees`
 sweeps the **protocol portion** to the treasury, while `agent_claim_lp_fees`
 claims the LP portion for markets the treasury created.
 
-**Migration to a successor treasury.** The treasury has no upgrade path or
-config setters by design, so redeploying it (bug fix, cap change, agent
-rotation) means deploying a new contract. `set_successor(successor)`
+**Price limits.** Size caps do not stop the treasury buying YES at 99% in a
+pool that was at 40% a moment ago (a buggy strategy, a compromised agent key,
+a sandwich). A `PricePolicy { max_buy_price_bps, min_sell_price_bps,
+max_impact_bps, max_slippage_bps }` (defaults 9500 / 500 / 500 / 200) is
+enforced inside every agent trade, using market-core's own `get_price` so the
+rounding matches what clients see:
+
+- buys need the outcome's spot price `<= max_buy_price_bps`, sells need it
+  `>= min_sell_price_bps`; `agent_create_market` needs `initial_yes_bps`
+  within `[min_sell, max_buy]`;
+- `min_shares_out` is raised to the same-transaction `quote_buy` minus
+  `max_slippage_bps` (never below 1), and `max_shares_in` is capped at
+  `quote_sell` plus `max_slippage_bps` (rounded up);
+- after the trade, `|p_after - p_before| <= max_impact_bps`.
+
+Because the quote runs against the same pool state as the trade, the quote
+floor only protects the agent's own intent; the band is what stops a
+front-runner (pushing the price out of band fails the trade), and the impact
+limit bounds how far any single trade moves the pool. Large trades in thin
+pools are rejected by the impact limit, so strategies must split them;
+`max_trade` and `max_impact_bps` interact. market-core's `SlippageExceeded`
+is remapped to the treasury's own `SlippageExceeded = 27`; other market-core
+errors are re-raised with market-core's codes, which overlap the treasury's
+numerically. The checks add three cross-contract view calls per trade: a
+1 USDC `agent_buy` against a real market-core measured ~3.5M instructions in
+`price_checks_cost_estimate_recorded`.
+
+**Timelocked configuration.** The global caps (`GlobalConfig`: collateral,
+market_core, `max_trade`, `max_market`, `max_daily`, `max_net_exposure`), the
+price policy and agent policies change through propose/execute with
+asymmetric rules: anything that only tightens (lower caps, a narrower band,
+fewer roles) applies immediately; anything that loosens (any raised cap, a
+new or widened agent, a changed collateral or market-core) waits
+`config_delay` (at least one day, set at construction, can only grow via
+`set_config_delay`) and is announced first by `ConfigProposed` /
+`AgentPolicyProposed` / `PricePolicyProposed`. A proposal that lowers one
+value and raises another is a loosening as a whole; split it to apply the
+tightening at once. Execution (`execute_config`, `execute_agent`,
+`execute_price_policy`) is permissionless once due, so it never depends on the
+admin; `cancel_*` is admin-only. A tightening applied while a loosening is
+pending leaves that proposal and its timer as they are. A collateral switch
+is only allowed for an empty treasury (no balance, open markets or queued
+withdrawals). A market-core switch leaves positions in the old core where they
+are: the old core is recorded as legacy, `legacy_redeem` /
+`legacy_claim_pool_remainder` recover them, and exposure for any later core
+is kept under keys namespaced by core address (the original core keeps the
+old `Market(id)` / `Net(id)` keys) so restarted market ids cannot collide.
+The new core still needs its own `set_treasury` for fee sweeps. This bounds
+what a compromised admin can unlock *for the agents*; it is not a custody
+control (see "Vault" and SECURITY.md).
+
+**Vault.** Deposits mint internal shares against a conservative NAV and
+withdrawals burn them; there is no admin `withdraw`. `nav() = idle +
+Σ floor(open markets) - queue_reserved`, where an open market's floor is its
+complete sets `min(yes, no)` plus `min(reserve_yes, reserve_no)` for an
+unclaimed LP role, and a final market counts its exact settlement value. The
+directional part of a position is valued at zero, so trading against a pool
+cannot raise NAV. The open-market index walked by `nav()` is bounded at
+`MAX_OPEN_MARKETS = 12` (two market-core reads each; 16 already used ~40 MB
+of the 40 MiB per-transaction memory limit); a buy or creation in a 13th
+market fails with `TooManyOpenMarkets`, and markets leave the index once
+redeemed and claimed. Share math rounds toward the vault and uses a virtual
+offset (1,000 shares / 1 stroop) plus dead shares on the first mint against
+donation-based share inflation; deposits must be at least `MIN_DEPOSIT`
+(10 USDC). `request_withdraw` prices the shares at once, pays what free idle
+collateral allows and queues the remainder as a FIFO ticket;
+`claim_withdraw(ticket)` (permissionless, pays the owner) settles the head
+ticket as capital returns, and agents can never spend `queue_reserved()`.
+While paused, `emergency_withdraw` pays shareholders their pro-rata part of
+free idle collateral without touching market-core. See
+[ADR 0005](adr/0005-treasury-vault.md).
+
+**Migration to a successor treasury.** The treasury has no upgrade path, so
+redeploying it (a bug fix, or anything the timelocked setters above do not
+cover) means deploying a new contract. `set_successor(successor)`
 (admin) records where value may go and emits `SuccessorSet`; then
 `migrate_market(market_id)` (admin, **not** agent) moves the treasury's
 YES/NO position and, if it is still the LP, its LP ownership for one market
@@ -305,10 +400,11 @@ emits `MarketMigrated`. The auth model:
 - The agent has no path: both migration entrypoints are `require_admin`.
 - The destination is fixed to the configured `Successor` — `migrate_market`
   takes no destination argument, so even a compromised agent key cannot
-  redirect value, and a compromised admin gains no new power over *user*
-  funds (it could already `withdraw`; migration only moves
-  treasury-owned positions, and the successor is visible on-chain via
-  `SuccessorSet`).
+  redirect value. It is still an admin power over shareholders' capital:
+  migrated positions leave this treasury's NAV without compensation, so a
+  compromised admin could move them to a successor it controls. The
+  successor is visible on-chain via `SuccessorSet` before any
+  `migrate_market`, and SECURITY.md lists this as a known admin power.
 - The treasury's calls to market-core's `transfer_position` / `transfer_lp`
   are *direct* calls, so market-core's `require_auth` on the treasury's own
   address is satisfied implicitly by the invoker rule — no
