@@ -81,6 +81,12 @@ if [ -z "${MAX_NET_EXPOSURE:-}" ]; then
     --network "$NETWORK" -- get_net_cap 2>/dev/null | tr -d '"' || true)
   MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
 fi
+# Treasuries deployed before the config timelock have no config_delay.
+if [ -z "${CONFIG_DELAY:-}" ]; then
+  CONFIG_DELAY=$(stellar contract invoke --id "$OLD_TREASURY" --source-account "$DEPLOYER_KEY" \
+    --network "$NETWORK" -- config_delay 2>/dev/null | tr -d '"' || true)
+  CONFIG_DELAY=${CONFIG_DELAY:-86400}
+fi
 if [ "$CONFIG_MARKET_CORE" != "$MARKET_CORE" ]; then
   log "warning: old treasury points at $CONFIG_MARKET_CORE, $OUT records $MARKET_CORE"
 fi
@@ -102,7 +108,8 @@ if [ -z "$NEW_TREASURY" ]; then
     --max_trade "$MAX_TRADE" \
     --max_market "$MAX_MARKET" \
     --max_daily "$MAX_DAILY" \
-    --max_net_exposure "$MAX_NET_EXPOSURE")
+    --max_net_exposure "$MAX_NET_EXPOSURE" \
+    --config_delay "$CONFIG_DELAY")
   json_set --arg id "$NEW_TREASURY" '.contracts.treasury_successor = $id'
 else
   log "successor treasury already recorded: $NEW_TREASURY"

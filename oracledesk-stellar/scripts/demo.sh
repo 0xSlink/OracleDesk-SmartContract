@@ -37,7 +37,7 @@ echo
 
 echo "### 2/6 trade (treasury.agent_buy) — price should move off 50/50"
 echo "price before: $(read_only "$MARKET_CORE" get_price --market_id "$MARKET_ID" --outcome Yes)"
-TRADE_TX=$(invoke "$TREASURY" "$AGENT_KEY" agent_buy --market_id "$MARKET_ID" --outcome Yes --collateral_in 100000000 --min_shares_out 0)
+TRADE_TX=$(invoke "$TREASURY" "$AGENT_KEY" agent_buy --agent "$AGENT" --market_id "$MARKET_ID" --outcome Yes --collateral_in 100000000 --min_shares_out 0)
 echo "shares received: $TRADE_TX"
 echo "price after:  $(read_only "$MARKET_CORE" get_price --market_id "$MARKET_ID" --outcome Yes)"
 echo
