@@ -260,7 +260,13 @@ markers in the files themselves:
   after `close_trade`) — this is the existing, intentional design (a
   lifetime cap on capital ever committed to one market), documented in
   `contracts/treasury/src/lib.rs`'s comments, but worth stating here since
-  it's easy to misread as a bug.
+  it's easy to misread as a bug. The separate **net** cap
+  (`max_net_exposure`, see `docs/architecture.md` "Caps") is what bounds
+  capital currently deployed; sells and redemptions free it.
+- **Price snapshots must be taken within oracle retention.** `snapshot_price`
+  lets resolution outlive the oracle's bounded history, but only if someone
+  calls it while the `close_time` record is still retained; there is no
+  keeper doing so automatically yet.
 
 ## Reproducing this
 

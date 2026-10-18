@@ -103,10 +103,28 @@ Independent resolution modes, all ultimately calling
 
 - **PriceThreshold**: reads a [Reflector](https://reflector.network) SEP-40
   price feed at (or after) the market's `close_time`, compares to a
-  threshold, enforces a max staleness window.
-- **Attested**: m-of-n signer votes; once `threshold` signers agree, a
+  threshold, enforces a max staleness window. Anyone may first pin that
+  read with `snapshot_price` (see "Oracle history retention" below).
+- **Attested**: m-of-n signer votes on a resolver-local
+  `AttestedOutcome { Yes, No, Invalid }`; once `threshold` signers agree, a
   dispute window opens; anyone can finalize after it elapses, or a guardian
   (the resolver's `admin`) can `cancel_proposal` during the window.
+  Finalizing `Yes`/`No` calls market-core's `resolve`; finalizing `Invalid`
+  calls `void_market` (every share redeems at 0.5) and emits
+  `CommitteeVoided`, so signers who agree a question is unanswerable no
+  longer need the guardian to void it. market-core's `Outcome` is
+  unchanged. Each outcome has its own counter and signers are deduplicated
+  per `(outcome, signer)`; the first outcome to reach threshold is
+  proposed and later `Yes`/`No` quorums never move it, except that an
+  `Invalid` quorum replaces a pending `Yes`/`No` proposal and restarts the
+  dispute window. `attest` requires `close_time` to have passed, which is
+  what keeps a committee void (market-core's `void_market` has no close-time
+  guard) from happening early. Proposals and finalizations emit
+  `ResolutionProposedV2` / `ResolutionFinalizedV2` (carrying
+  `AttestedOutcome`); the old `Outcome`-typed events are no longer
+  emitted. Storage keys are versioned (`AttestationV2`, `CountV2`,
+  `ProposalV2`); see ADR 0003 for the redeploy runbook and the legacy-key
+  fallback.
 - **Weighted keys**: a committee of raw Ed25519 public keys with weights.
   Members sign a domain-separated message off-chain and anyone submits the
   signatures to `submit_signatures` in one transaction; the weight threshold
@@ -129,6 +147,35 @@ market's commitment (`register_price_spec`, `register_signer_spec`,
 `register_committee_spec`, or `register_hybrid_spec` — see ADR 0001).
 A guardian can also `guardian_void_market` an unresolvable market directly,
 subject to time windows and typed audit reasons.
+
+#### Oracle history retention
+
+SEP-40 oracles, Reflector included, keep a bounded history: records are
+published at a fixed cadence (the feed's `resolution()`) and only a fixed
+number of recent ones are retained, so `price(asset, timestamp)` returns
+`None` once `timestamp` falls outside that window. Look the current values
+up from Reflector's documentation or the feed contract itself; do not
+assume them. A price market nobody resolves before its `close_time` record
+ages out would otherwise return `PriceUnavailable` forever and could only be
+voided.
+
+`snapshot_price(market_id, caller)` closes that gap. Anyone may call it
+after `close_time` while the market is unresolved; it reads the committed
+feed exactly as resolution does, validates it with the same rule
+(`validate_price`: not after close, no older than `max_staleness`), and
+stores it as a `PriceSnapshot`. An invalid read is never stored, and the
+first valid snapshot wins (`SnapshotExists`): the answer for a fixed
+`(asset, close_time)` is deterministic, so this deliberately prefers
+determinism over an oracle later rewriting history. Every price path
+(`resolve_price`, `expire_market`, `open_fallback`, and the guardian's
+`OracleUnavailable` check) uses a stored snapshot before the live feed and
+then skips the oracle call. `PriceResolutionV2` adds `from_snapshot`; the
+original `PriceResolution` is still emitted alongside it for one release.
+
+Operators and agents should call `snapshot_price` within one oracle period
+of `close_time` (CLI: `stellar contract invoke --id $RESOLVER -- snapshot_price
+--market_id <id> --caller <address>`). A late snapshot is still accepted as
+long as the oracle has the record.
 
 #### Bonded disputes (`SignersDisputable`)
 
@@ -210,7 +257,38 @@ automated agent can deploy — an agent's own key calling `market-core`
 directly would just be trading its own separate funds, not bypassing a cap
 on the treasury's money. The `*_v2` twins forward the same caps plus
 market-core's deadline / limit-price bounds, so a revert from either layer
-leaves the caps unchanged (the whole invocation is atomic). The treasury's
+leaves the caps unchanged (the whole invocation is atomic).
+
+**Caps.** Four limits apply to every buy and market creation:
+
+- `max_trade`: per call.
+- `max_market`: lifetime capital ever committed to one market. Never freed,
+  not by sells, redemptions or `close_trade`.
+- `max_daily`: a **sliding** 24h limit. Usage is kept in 25 hourly buckets
+  (`UsageWindow`, instance storage); a trade at hour `h` is accepted only if
+  buckets `h-24 ..= h` plus the trade stay within `max_daily`. Every real
+  24h interval falls inside those 25 hours, so no trailing 24h ever exceeds
+  the cap. The rounding is conservative: a trade keeps counting for 24-25h.
+  (The previous fixed window reset lazily, so `max_daily` could be spent
+  just before a reset and again just after it.) `daily_usage()` keeps its
+  `DailyUsage` shape (`day_start` is now the start of the oldest counted
+  hour) and is side-effect free; `daily_usage_detail()` returns the buckets
+  and `daily_headroom()` the remaining allowance.
+- `max_net_exposure`: capital *currently* deployed across all markets. The
+  treasury records collateral in (buys, creations) and out (sells,
+  redemptions, pool remainders, LP fee claims) per market (`NetPosition`)
+  and keeps a running `net_exposure() = sum(max(0, in - out))`. Profit in
+  one market floors at zero and never offsets another. A sell frees net
+  headroom but not lifetime headroom; `close_trade` changes neither;
+  `migrate_market` drops the market from net accounting. Enforcement uses
+  only these local counters (no extra cross-contract call on the hot path)
+  and never a pool price: a spot-valued cap would let anyone pump a price to
+  unlock headroom or crash it to block the agent. `market_valuation(id)`
+  reports `cost_basis`, a manipulation-resistant `floor_value` (complete
+  sets `min(yes, no)` plus `min(reserve_yes, reserve_no)` as unclaimed LP;
+  the settlement value once final), an informational `spot_value`, and
+  `at_risk = max(0, cost_basis - floor_value)`. Net accounting starts when
+  the contract is deployed (missing entries read as zero). The treasury's
 creator-side claims are split the same way the fees are: `collect_market_fees`
 sweeps the **protocol portion** to the treasury, while `agent_claim_lp_fees`
 claims the LP portion for markets the treasury created.

@@ -3,7 +3,7 @@
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, token, vec, Address,
-    BytesN, Env, IntoVal, String, Symbol,
+    BytesN, Env, IntoVal, String, Symbol, Vec,
 };
 
 // See the comment on the equivalent `mod market_core` in
@@ -14,11 +14,22 @@ use soroban_sdk::{
 mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
-use market_core::{Category, Client as MarketCoreClient, Outcome};
+use market_core::{Category, Client as MarketCoreClient, MarketStatus, Outcome};
 
 const DAY_SECONDS: u64 = 86_400;
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+/// Width of one bucket of the sliding daily window.
+const BUCKET_SECONDS: u64 = 3_600;
+/// Buckets checked against `max_daily`: the trade's own hour plus the 24
+/// before it. Any real 24h interval `(t - 24h, t]` touches at most hours
+/// `h - 24 ..= h` (`h = t / 3600`), so summing 25 buckets never under-counts;
+/// with 24 the partially-covered hour `h - 24` could add up to one more
+/// bucket's worth on top of `max_daily`. The effective window is therefore
+/// 24-25h: slightly conservative, never permissive.
+const BUCKETS: u32 = 25;
+/// Basis points in 1 (prices from market-core are in bps).
+const BPS: i128 = 10_000;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -38,6 +49,9 @@ pub struct MarketExposure {
     pub open: bool,
 }
 
+/// Summary of the sliding daily window, returned by `daily_usage`.
+/// `day_start` is the start of the oldest hour still counted and `amount`
+/// the usage summed over the whole window (see [`UsageWindow`]).
 #[contracttype]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct DailyUsage {
@@ -45,14 +59,75 @@ pub struct DailyUsage {
     pub amount: i128,
 }
 
+/// Hourly ring buffer behind `max_daily`. Kept in instance storage: ~400
+/// bytes that every call loads anyway, so it costs no extra ledger-entry
+/// read (a persistent entry would add one per trade).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct UsageWindow {
+    /// Hour index (`timestamp / BUCKET_SECONDS`) of the newest bucket.
+    pub head_hour: u64,
+    /// Always `BUCKETS` long. `amounts[i]` is the usage of hour
+    /// `head_hour - ((head_idx - i) mod BUCKETS)`.
+    pub amounts: Vec<i128>,
+    pub head_idx: u32,
+}
+
+/// Collateral the treasury has sent into (`collateral_in`) and received back
+/// from (`collateral_out`) one market. Accounting starts when this code was
+/// deployed: a missing entry reads as zero.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct NetPosition {
+    pub collateral_in: i128,
+    pub collateral_out: i128,
+}
+
+impl NetPosition {
+    /// Capital still deployed: `max(0, in - out)`. Profit floors at zero so it
+    /// never offsets exposure in another market.
+    fn cost_basis(&self) -> i128 {
+        self.collateral_in
+            .saturating_sub(self.collateral_out)
+            .max(0)
+    }
+}
+
+/// `market_valuation` result. Only `cost_basis` is enforced (by
+/// `max_net_exposure`); the others are informational.
+#[contracttype]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct Valuation {
+    pub cost_basis: i128,
+    /// What the treasury gets back whatever the outcome, from state a price
+    /// move cannot raise: complete sets `min(yes, no)` plus, as the unclaimed
+    /// LP, `min(reserve_yes, reserve_no)`. After finality, the settlement
+    /// value.
+    pub floor_value: i128,
+    /// Holdings at the pool's spot price. Manipulable by any trader, so it is
+    /// never used for enforcement.
+    pub spot_value: i128,
+    /// `max(0, cost_basis - floor_value)`.
+    pub at_risk: i128,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
     Config,
     Market(u64),
+    /// Legacy fixed-window `DailyUsage`; migrated into `UsageWindow` and
+    /// removed on the first trade after an upgrade.
     Daily,
     Paused,
     Successor,
+    UsageWindow,
+    /// `max_net_exposure` (kept out of `RiskConfig` so its XDR shape and
+    /// `get_config` stay binding-compatible).
+    NetCap,
+    Net(u64),
+    /// Running `sum(max(0, in - out))` over all markets.
+    NetTotal,
 }
 
 #[contracterror]
@@ -70,6 +145,9 @@ pub enum Error {
     InsufficientBalance = 9,
     Paused = 10,
     NoSuccessor = 11,
+    /// Not market-core's error 12 (`SlippageExceeded`): market-core errors
+    /// reach callers of treasury entrypoints with market-core's own codes.
+    NetExposureExceeded = 12,
 }
 
 #[contractevent]
@@ -82,6 +160,16 @@ pub struct TradeAuthorized {
     pub amount: i128,
     pub market_total: i128,
     pub daily_total: i128,
+}
+
+/// Net exposure after any treasury money movement in `market_id`.
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct NetExposureUpdated {
+    #[topic]
+    pub market_id: u64,
+    pub net_market: i128,
+    pub net_total: i128,
 }
 
 #[contractevent]
@@ -124,6 +212,8 @@ pub struct Treasury;
 
 #[contractimpl]
 impl Treasury {
+    /// `max_net_exposure` caps capital deployed in open positions across all
+    /// markets at once (see `net_exposure`); it must be at least `max_trade`.
     #[allow(clippy::too_many_arguments)]
     pub fn __constructor(
         env: Env,
@@ -134,8 +224,13 @@ impl Treasury {
         max_trade: i128,
         max_market: i128,
         max_daily: i128,
+        max_net_exposure: i128,
     ) {
-        if max_trade <= 0 || max_market < max_trade || max_daily < max_market {
+        if max_trade <= 0
+            || max_market < max_trade
+            || max_daily < max_market
+            || max_net_exposure < max_trade
+        {
             panic!("invalid risk configuration");
         }
         env.storage().instance().set(&DataKey::Admin, &admin);
@@ -151,12 +246,12 @@ impl Treasury {
             },
         );
         env.storage().instance().set(
-            &DataKey::Daily,
-            &DailyUsage {
-                day_start: env.ledger().timestamp(),
-                amount: 0,
-            },
+            &DataKey::UsageWindow,
+            &Self::empty_window(&env, env.ledger().timestamp() / BUCKET_SECONDS),
         );
+        env.storage()
+            .instance()
+            .set(&DataKey::NetCap, &max_net_exposure);
         env.storage().instance().set(&DataKey::Paused, &false);
     }
 
@@ -173,8 +268,114 @@ impl Treasury {
             .balance(&env.current_contract_address()))
     }
 
+    /// Usage over the sliding window as of now: `amount` sums every bucket
+    /// still counted against `max_daily`, `day_start` is the start of the
+    /// oldest of them. Side-effect free (it advances a copy), so repeated
+    /// reads without trades in between return the same value.
     pub fn daily_usage(env: Env) -> Result<DailyUsage, Error> {
-        Self::rolled_daily_usage(&env)
+        let window = Self::daily_usage_detail(env)?;
+        Ok(DailyUsage {
+            day_start: window
+                .head_hour
+                .saturating_sub((BUCKETS - 1) as u64)
+                .saturating_mul(BUCKET_SECONDS),
+            amount: Self::window_sum(&window)?,
+        })
+    }
+
+    /// The hourly buckets behind `daily_usage`, advanced to now (not stored).
+    pub fn daily_usage_detail(env: Env) -> Result<UsageWindow, Error> {
+        let mut window = Self::load_window(&env)?;
+        Self::advance(&mut window, env.ledger().timestamp() / BUCKET_SECONDS);
+        Ok(window)
+    }
+
+    /// How much more the agent may deploy right now before `max_daily`
+    /// (`max_daily - window sum`, floored at 0), for pre-flight checks.
+    pub fn daily_headroom(env: Env) -> Result<i128, Error> {
+        let config = Self::get_config(env.clone())?;
+        let used = Self::daily_usage(env)?.amount;
+        Ok(config.max_daily.saturating_sub(used).max(0))
+    }
+
+    /// `max_net_exposure`. A treasury deployed before the net cap existed has
+    /// no stored value and uses `max_daily`.
+    pub fn get_net_cap(env: Env) -> Result<i128, Error> {
+        let config = Self::get_config(env.clone())?;
+        Ok(env
+            .storage()
+            .instance()
+            .get(&DataKey::NetCap)
+            .unwrap_or(config.max_daily))
+    }
+
+    /// Capital currently deployed across all markets:
+    /// `sum(max(0, collateral_in - collateral_out))`, the figure
+    /// `max_net_exposure` is enforced against.
+    pub fn net_exposure(env: Env) -> i128 {
+        env.storage()
+            .instance()
+            .get(&DataKey::NetTotal)
+            .unwrap_or(0)
+    }
+
+    pub fn net_position(env: Env, market_id: u64) -> NetPosition {
+        Self::load_net(&env, market_id)
+    }
+
+    /// Conservative valuation of the treasury's holdings in `market_id`
+    /// (see [`Valuation`]). Two cross-contract reads (`get_market`,
+    /// `get_position`); a view only, never on the trading path.
+    pub fn market_valuation(env: Env, market_id: u64) -> Result<Valuation, Error> {
+        let config = Self::get_config(env.clone())?;
+        let treasury_addr = env.current_contract_address();
+        let client = MarketCoreClient::new(&env, &config.market_core);
+        let market = client.get_market(&market_id);
+        let position = client.get_position(&market_id, &treasury_addr);
+        let lp = market.creator == treasury_addr && !market.lp_claimed;
+        let (lp_yes, lp_no) = if lp {
+            (market.reserve_yes, market.reserve_no)
+        } else {
+            (0, 0)
+        };
+
+        let (floor_value, spot_value) = match market.status {
+            MarketStatus::Open => {
+                let floor = position
+                    .yes
+                    .min(position.no)
+                    .saturating_add(lp_yes.min(lp_no));
+                // Mirrors market-core's `price_yes_bps` from the reserves just
+                // read, so spot costs no third call.
+                let sum = market.reserve_yes.saturating_add(market.reserve_no);
+                let p_yes = if sum > 0 {
+                    market.reserve_no.saturating_mul(BPS) / sum
+                } else {
+                    BPS / 2
+                };
+                let yes = position.yes.saturating_add(lp_yes);
+                let no = position.no.saturating_add(lp_no);
+                let spot = yes
+                    .saturating_mul(p_yes)
+                    .saturating_add(no.saturating_mul(BPS - p_yes))
+                    / BPS;
+                (floor, spot)
+            }
+            // Final markets are worth exactly what market-core's
+            // `settle_value` pays out.
+            status => {
+                let settled = Self::settle_value(&status, position.yes, position.no)
+                    .saturating_add(Self::settle_value(&status, lp_yes, lp_no));
+                (settled, settled)
+            }
+        };
+        let cost_basis = Self::load_net(&env, market_id).cost_basis();
+        Ok(Valuation {
+            cost_basis,
+            floor_value,
+            spot_value,
+            at_risk: cost_basis.saturating_sub(floor_value).max(0),
+        })
     }
 
     pub fn set_paused(env: Env, paused: bool) -> Result<(), Error> {
@@ -254,6 +455,7 @@ impl Treasury {
             &initial_yes_bps,
         );
         Self::reserve_capacity(&env, &config, market_id, seed_amount)?;
+        Self::reserve_net(&env, market_id, seed_amount)?;
         Ok(market_id)
     }
 
@@ -342,13 +544,15 @@ impl Treasury {
             ),
         };
         Self::reserve_capacity(&env, &config, market_id, collateral_in)?;
+        Self::reserve_net(&env, market_id, collateral_in)?;
         Ok(shares)
     }
 
     /// Sells `outcome` shares back into the pool for exactly
     /// `collateral_out`. This returns capital to the treasury (market-core
     /// pays out of its own balance), so it is not capped and does not need
-    /// the nested-transfer pre-authorization that buying does.
+    /// the nested-transfer pre-authorization that buying does. It frees net
+    /// headroom (`collateral_out` is recorded) but never lifetime headroom.
     pub fn agent_sell(
         env: Env,
         market_id: u64,
@@ -394,7 +598,7 @@ impl Treasury {
         config.agent.require_auth();
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(&env, &config.market_core);
-        Ok(match bound {
+        let shares_in = match bound {
             Some((limit_price_bps, deadline)) => client.sell_v2(
                 &treasury_addr,
                 &market_id,
@@ -411,12 +615,15 @@ impl Treasury {
                 &collateral_out,
                 &max_shares_in,
             ),
-        })
+        };
+        // market-core transfers exactly `collateral_out` on success.
+        Self::record_return(&env, market_id, collateral_out)?;
+        Ok(shares_in)
     }
 
     /// Marks a market's exposure as exited. Pure bookkeeping (see
     /// `MarketExposure`) for the future exposure dashboard; it does not move
-    /// funds or free the cumulative per-market cap.
+    /// funds or free either the cumulative per-market cap or net headroom.
     pub fn close_trade(env: Env, market_id: u64) -> Result<i128, Error> {
         let config = Self::get_config(env.clone())?;
         config.agent.require_auth();
@@ -436,14 +643,20 @@ impl Treasury {
         let config = Self::get_config(env.clone())?;
         config.agent.require_auth();
         let treasury_addr = env.current_contract_address();
-        Ok(MarketCoreClient::new(&env, &config.market_core).redeem(&treasury_addr, &market_id))
+        let payout =
+            MarketCoreClient::new(&env, &config.market_core).redeem(&treasury_addr, &market_id);
+        Self::record_return(&env, market_id, payout)?;
+        Ok(payout)
     }
 
     /// Claims the LP pool remainder for a market the treasury created.
     pub fn claim_pool_remainder(env: Env, market_id: u64) -> Result<i128, Error> {
         let config = Self::get_config(env.clone())?;
         config.agent.require_auth();
-        Ok(MarketCoreClient::new(&env, &config.market_core).claim_pool_remainder(&market_id))
+        let payout =
+            MarketCoreClient::new(&env, &config.market_core).claim_pool_remainder(&market_id);
+        Self::record_return(&env, market_id, payout)?;
+        Ok(payout)
     }
 
     /// Claims the market's LP fee share for a market the treasury created.
@@ -452,7 +665,9 @@ impl Treasury {
     pub fn agent_claim_lp_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         let config = Self::get_config(env.clone())?;
         config.agent.require_auth();
-        Ok(MarketCoreClient::new(&env, &config.market_core).claim_lp_fees(&market_id))
+        let amount = MarketCoreClient::new(&env, &config.market_core).claim_lp_fees(&market_id);
+        Self::record_return(&env, market_id, amount)?;
+        Ok(amount)
     }
 
     /// Pulls accrued **protocol** fees from a configured market-core contract.
@@ -537,6 +752,9 @@ impl Treasury {
         let mut exposure = Self::market_exposure(&env, market_id);
         exposure.open = false;
         Self::save_market(&env, market_id, &exposure);
+        // The holdings now belong to the successor, so none of this market's
+        // capital is at risk here any more.
+        Self::clear_net(&env, market_id)?;
         MarketMigrated {
             market_id,
             successor,
@@ -572,32 +790,101 @@ impl Treasury {
         Ok(())
     }
 
-    fn rolled_daily_usage(env: &Env) -> Result<DailyUsage, Error> {
-        let usage: DailyUsage = env
-            .storage()
-            .instance()
-            .get(&DataKey::Daily)
-            .ok_or(Error::NotInitialized)?;
-        if env.ledger().timestamp() >= usage.day_start + DAY_SECONDS {
-            return Ok(DailyUsage {
-                day_start: env.ledger().timestamp(),
-                amount: 0,
-            });
+    fn empty_window(env: &Env, head_hour: u64) -> UsageWindow {
+        let mut amounts = Vec::new(env);
+        for _ in 0..BUCKETS {
+            amounts.push_back(0i128);
         }
-        Ok(usage)
+        UsageWindow {
+            head_hour,
+            amounts,
+            head_idx: 0,
+        }
+    }
+
+    /// The stored window, or one migrated from the legacy fixed-window
+    /// `DataKey::Daily` (not persisted here; `reserve_capacity` saves it and
+    /// removes the legacy entry). Legacy usage still inside its day counts in
+    /// full in the current hour's bucket: conservative, since it then stays
+    /// in the window for up to 25 more hours.
+    fn load_window(env: &Env) -> Result<UsageWindow, Error> {
+        let storage = env.storage().instance();
+        if let Some(window) = storage.get(&DataKey::UsageWindow) {
+            return Ok(window);
+        }
+        let legacy: DailyUsage = storage.get(&DataKey::Daily).ok_or(Error::NotInitialized)?;
+        let now = env.ledger().timestamp();
+        let mut window = Self::empty_window(env, now / BUCKET_SECONDS);
+        if now < legacy.day_start.saturating_add(DAY_SECONDS) {
+            window.amounts.set(window.head_idx, legacy.amount);
+        }
+        Ok(window)
+    }
+
+    /// Moves the head to `now_hour`, zeroing every bucket that left the
+    /// window. At most `BUCKETS` steps however long the treasury was idle.
+    /// An equal or earlier hour is a no-op: ledger time never goes backwards
+    /// on-chain (tests that rewind `set_timestamp` just keep the current head).
+    fn advance(window: &mut UsageWindow, now_hour: u64) {
+        if now_hour <= window.head_hour {
+            return;
+        }
+        let steps = core::cmp::min(now_hour - window.head_hour, BUCKETS as u64) as u32;
+        for _ in 0..steps {
+            window.head_idx = (window.head_idx + 1) % BUCKETS;
+            window.amounts.set(window.head_idx, 0);
+        }
+        window.head_hour = now_hour;
+    }
+
+    fn window_sum(window: &UsageWindow) -> Result<i128, Error> {
+        window.amounts.iter().try_fold(0i128, |sum, amount| {
+            sum.checked_add(amount).ok_or(Error::DailyCapExceeded)
+        })
+    }
+
+    /// Advances `window` to `now`, then adds `amount` to the current hour if
+    /// the window total stays within `max_daily`. Returns the new total.
+    fn consume_window(
+        window: &mut UsageWindow,
+        now: u64,
+        amount: i128,
+        max_daily: i128,
+    ) -> Result<i128, Error> {
+        Self::advance(window, now / BUCKET_SECONDS);
+        let total = Self::window_sum(window)?
+            .checked_add(amount)
+            .ok_or(Error::DailyCapExceeded)?;
+        if total > max_daily {
+            return Err(Error::DailyCapExceeded);
+        }
+        let head = window
+            .amounts
+            .get(window.head_idx)
+            .ok_or(Error::NotInitialized)?;
+        window.amounts.set(
+            window.head_idx,
+            head.checked_add(amount).ok_or(Error::DailyCapExceeded)?,
+        );
+        Ok(total)
     }
 
     /// Checks the per-market and daily caps for `amount` and, if both pass,
     /// records it. Called *after* the market-core call it authorizes:
     /// Soroban invocations are atomic, so if this returns `Err` the whole
     /// transaction (including the trade already made) reverts.
+    ///
+    /// The daily cap is a sliding window: usage in the trade's hour and the
+    /// 24 hours before it (see `BUCKETS`) may never exceed `max_daily`, so
+    /// no trailing 24h interval can either. `TradeAuthorized.daily_total` is
+    /// that window sum after the trade.
     fn reserve_capacity(
         env: &Env,
         config: &RiskConfig,
         market_id: u64,
         amount: i128,
     ) -> Result<(), Error> {
-        let mut usage = Self::rolled_daily_usage(env)?;
+        let mut window = Self::load_window(env)?;
         let mut exposure = Self::market_exposure(env, market_id);
         let new_market = exposure
             .amount
@@ -606,18 +893,20 @@ impl Treasury {
         if new_market > config.max_market {
             return Err(Error::MarketCapExceeded);
         }
-        let new_daily = usage
-            .amount
-            .checked_add(amount)
-            .ok_or(Error::DailyCapExceeded)?;
-        if new_daily > config.max_daily {
-            return Err(Error::DailyCapExceeded);
-        }
+        let new_daily = Self::consume_window(
+            &mut window,
+            env.ledger().timestamp(),
+            amount,
+            config.max_daily,
+        )?;
         exposure.amount = new_market;
         exposure.open = true;
-        usage.amount = new_daily;
         Self::save_market(env, market_id, &exposure);
-        env.storage().instance().set(&DataKey::Daily, &usage);
+        let storage = env.storage().instance();
+        storage.set(&DataKey::UsageWindow, &window);
+        storage.remove(&DataKey::Daily);
+        // The window must outlive idle days, so keep the instance live.
+        storage.extend_ttl(BUMP_THRESHOLD, BUMP_TO);
         TradeAuthorized {
             market_id,
             agent: config.agent.clone(),
@@ -627,6 +916,110 @@ impl Treasury {
         }
         .publish(env);
         Ok(())
+    }
+
+    // ----- net exposure ------------------------------------------------------
+    // Two caps with different questions: `max_market` limits what was *ever*
+    // committed to one market (lifetime, never freed); `max_net_exposure`
+    // limits what is *currently* committed across all markets (cost basis,
+    // freed by sells, redemptions and claims). Enforcement reads only local
+    // counters, never a pool price: a spot-valued cap would let anyone pump
+    // the price to unlock headroom, or crash it to block the agent.
+
+    fn load_net(env: &Env, market_id: u64) -> NetPosition {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Net(market_id))
+            .unwrap_or(NetPosition {
+                collateral_in: 0,
+                collateral_out: 0,
+            })
+    }
+
+    /// Stores `next` for `market_id`, moves `NetTotal` by the change in that
+    /// market's cost basis (so it never needs iterating) and returns the new
+    /// total.
+    fn save_net(
+        env: &Env,
+        market_id: u64,
+        before: &NetPosition,
+        next: &NetPosition,
+    ) -> Result<i128, Error> {
+        let total = Self::net_exposure(env.clone())
+            .checked_sub(before.cost_basis())
+            .and_then(|t| t.checked_add(next.cost_basis()))
+            .ok_or(Error::NetExposureExceeded)?;
+        let key = DataKey::Net(market_id);
+        env.storage().persistent().set(&key, next);
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().set(&DataKey::NetTotal, &total);
+        NetExposureUpdated {
+            market_id,
+            net_market: next.cost_basis(),
+            net_total: total,
+        }
+        .publish(env);
+        Ok(total)
+    }
+
+    /// Records `amount` sent into `market_id` and enforces `max_net_exposure`
+    /// on the new total. Like `reserve_capacity`, runs after the market-core
+    /// call and relies on the invocation reverting on `Err`.
+    fn reserve_net(env: &Env, market_id: u64, amount: i128) -> Result<(), Error> {
+        let before = Self::load_net(env, market_id);
+        let next = NetPosition {
+            collateral_in: before
+                .collateral_in
+                .checked_add(amount)
+                .ok_or(Error::NetExposureExceeded)?,
+            ..before
+        };
+        let total = Self::save_net(env, market_id, &before, &next)?;
+        if total > Self::get_net_cap(env.clone())? {
+            return Err(Error::NetExposureExceeded);
+        }
+        Ok(())
+    }
+
+    /// Records `amount` received back from `market_id` (a sell, redemption,
+    /// pool remainder or LP fee claim).
+    fn record_return(env: &Env, market_id: u64, amount: i128) -> Result<(), Error> {
+        if amount <= 0 {
+            return Ok(());
+        }
+        let before = Self::load_net(env, market_id);
+        let next = NetPosition {
+            collateral_out: before
+                .collateral_out
+                .checked_add(amount)
+                .ok_or(Error::InvalidAmount)?,
+            ..before
+        };
+        Self::save_net(env, market_id, &before, &next)?;
+        Ok(())
+    }
+
+    /// Drops `market_id` from net accounting (its holdings left the treasury).
+    fn clear_net(env: &Env, market_id: u64) -> Result<(), Error> {
+        let before = Self::load_net(env, market_id);
+        let cleared = NetPosition {
+            collateral_in: 0,
+            collateral_out: 0,
+        };
+        Self::save_net(env, market_id, &before, &cleared)?;
+        Ok(())
+    }
+
+    /// Private mirror of market-core's `math::settle_value` for final markets.
+    fn settle_value(status: &MarketStatus, yes: i128, no: i128) -> i128 {
+        match status {
+            MarketStatus::Resolved(Outcome::Yes) => yes,
+            MarketStatus::Resolved(Outcome::No) => no,
+            MarketStatus::Void => yes.saturating_add(no) / 2,
+            MarketStatus::Open => 0,
+        }
     }
 
     /// Pre-authorizes the SEP-41 `transfer(from, to, amount)` that
@@ -673,6 +1066,8 @@ impl Treasury {
 
 #[cfg(test)]
 mod test {
+    extern crate std;
+
     use super::*;
     use soroban_sdk::{
         testutils::{Address as _, Ledger, MockAuth, MockAuthInvoke},
@@ -703,6 +1098,15 @@ mod test {
     }
 
     fn fixture_with_caps(max_trade: i128, max_market: i128, max_daily: i128) -> Fixture {
+        fixture_with_net_cap(max_trade, max_market, max_daily, max_daily)
+    }
+
+    fn fixture_with_net_cap(
+        max_trade: i128,
+        max_market: i128,
+        max_daily: i128,
+        max_net_exposure: i128,
+    ) -> Fixture {
         let env = Env::default();
         env.mock_all_auths();
         env.ledger().set_timestamp(1_000);
@@ -752,6 +1156,7 @@ mod test {
                 &max_trade,
                 &max_market,
                 &max_daily,
+                &max_net_exposure,
             ),
         );
         Fixture {
@@ -827,8 +1232,12 @@ mod test {
         );
     }
 
+    /// Replaces the old `daily_cap_resets_after_one_day`, which pinned the
+    /// fixed window's reset. With 25 hourly buckets a trade from hour 0 still
+    /// counts exactly 24h later (hour 24's window is hours 0..=24) and only
+    /// drops out once the head reaches hour 25.
     #[test]
-    fn daily_cap_resets_after_one_day() {
+    fn daily_cap_frees_capacity_after_window_slides() {
         let f = fixture();
         f.treasury
             .agent_buy(&f.market_id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
@@ -836,6 +1245,8 @@ mod test {
         f.env.ledger().set_timestamp(1_000 + DAY_SECONDS);
         f.treasury
             .agent_buy(&f.market_id, &Outcome::Yes, &(20 * 10_000_000_i128), &0);
+        assert_eq!(f.treasury.daily_usage().amount, 40 * 10_000_000_i128);
+        f.env.ledger().set_timestamp(25 * BUCKET_SECONDS);
         assert_eq!(f.treasury.daily_usage().amount, 20 * 10_000_000_i128);
     }
 
@@ -1359,5 +1770,527 @@ mod test {
             f.market_core.get_position(&f.market_id, &f.treasury_id).yes,
             0
         );
+    }
+
+    // ----- sliding daily window -------------------------------------------
+
+    const USDC: i128 = 10_000_000;
+
+    /// A second externally-created market in the fixture's market-core.
+    fn extra_market(f: &Fixture, tag: u8) -> u64 {
+        f.market_core.create_market(
+            &f.market_core.get_market(&f.market_id).creator,
+            &BytesN::from_array(&f.env, &[tag; 32]),
+            &BytesN::from_array(&f.env, &[tag.wrapping_add(100); 32]),
+            &String::from_str(&f.env, "ipfs://treasury-extra"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        )
+    }
+
+    fn stored_window(f: &Fixture) -> Option<UsageWindow> {
+        f.env.as_contract(&f.treasury_id, || {
+            f.env.storage().instance().get(&DataKey::UsageWindow)
+        })
+    }
+
+    #[test]
+    fn burst_across_old_window_boundary_is_rejected() {
+        let f = fixture_with_caps(20 * USDC, 60 * USDC, 60 * USDC);
+        // The old fixed window began at 1_000 and reset at 1_000 + 86_400.
+        f.env.ledger().set_timestamp(1_000 + 86_399);
+        for _ in 0..3 {
+            f.treasury
+                .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        }
+        f.env.ledger().set_timestamp(1_000 + 86_401);
+        let other = extra_market(&f, 21);
+        assert_eq!(
+            f.treasury.try_agent_buy(&other, &Outcome::Yes, &USDC, &0),
+            Err(Ok(Error::DailyCapExceeded))
+        );
+    }
+
+    #[test]
+    fn usage_expires_after_25_hours() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        // Hour 0 is still in hour 24's window...
+        f.env.ledger().set_timestamp(24 * BUCKET_SECONDS + 3_599);
+        assert_eq!(f.treasury.daily_headroom(), 40 * USDC);
+        // ...and gone from hour 25's.
+        f.env.ledger().set_timestamp(25 * BUCKET_SECONDS);
+        assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
+    }
+
+    #[test]
+    fn same_hour_trades_accumulate() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.env.ledger().set_timestamp(3_599);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::No, &(15 * USDC), &0);
+        let window = f.treasury.daily_usage_detail();
+        assert_eq!(window.head_hour, 0);
+        assert_eq!(window.amounts.get(window.head_idx), Some(35 * USDC));
+        assert_eq!(window.amounts.iter().sum::<i128>(), 35 * USDC);
+    }
+
+    #[test]
+    fn long_idle_gap_clears_all_buckets() {
+        let f = fixture();
+        for hour in [0u64, 5, 20] {
+            f.env.ledger().set_timestamp(hour * BUCKET_SECONDS + 1_000);
+            f.treasury
+                .agent_buy(&f.market_id, &Outcome::Yes, &(10 * USDC), &0);
+        }
+        f.env
+            .ledger()
+            .set_timestamp(20 * BUCKET_SECONDS + 10 * DAY_SECONDS);
+        let window = f.treasury.daily_usage_detail();
+        assert_eq!(window.amounts.len(), BUCKETS);
+        assert!(window.amounts.iter().all(|a| a == 0));
+        assert_eq!(f.treasury.daily_usage().amount, 0);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        assert_eq!(f.treasury.daily_usage().amount, 20 * USDC);
+    }
+
+    #[test]
+    fn daily_usage_view_is_pure_and_stable() {
+        let f = fixture();
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let stored = stored_window(&f);
+        f.env.ledger().set_timestamp(5 * BUCKET_SECONDS);
+        let first = f.treasury.daily_usage();
+        let second = f.treasury.daily_usage();
+        assert_eq!(first, second);
+        assert_eq!(
+            first,
+            DailyUsage {
+                day_start: 0,
+                amount: 20 * USDC
+            }
+        );
+        // Reading advanced a copy only.
+        assert_eq!(stored_window(&f), stored);
+        assert_eq!(stored.unwrap().head_hour, 0);
+    }
+
+    #[test]
+    fn legacy_daily_entry_is_migrated_conservatively() {
+        let f = fixture();
+        let install_legacy = |day_start: u64, amount: i128| {
+            f.env.as_contract(&f.treasury_id, || {
+                let storage = f.env.storage().instance();
+                storage.remove(&DataKey::UsageWindow);
+                storage.set(&DataKey::Daily, &DailyUsage { day_start, amount });
+            })
+        };
+
+        // Legacy day still running: its usage counts in full.
+        install_legacy(1_000, 50 * USDC);
+        f.env.ledger().set_timestamp(1_000 + 23 * BUCKET_SECONDS);
+        assert_eq!(f.treasury.daily_usage().amount, 50 * USDC);
+        let other = extra_market(&f, 22);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&other, &Outcome::Yes, &(20 * USDC), &0),
+            Err(Ok(Error::DailyCapExceeded))
+        );
+        f.treasury
+            .agent_buy(&other, &Outcome::Yes, &(10 * USDC), &0);
+        f.env.as_contract(&f.treasury_id, || {
+            assert!(!f.env.storage().instance().has(&DataKey::Daily));
+        });
+        let window = stored_window(&f).unwrap();
+        assert_eq!(window.amounts.iter().sum::<i128>(), 60 * USDC);
+
+        // Legacy day already over: the window starts empty.
+        install_legacy(1_000, 50 * USDC);
+        f.env.ledger().set_timestamp(1_000 + DAY_SECONDS);
+        assert_eq!(f.treasury.daily_usage().amount, 0);
+    }
+
+    #[test]
+    fn daily_headroom_matches_cap_minus_window_sum() {
+        let f = fixture();
+        assert_eq!(f.treasury.daily_headroom(), 60 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.env.ledger().set_timestamp(2 * BUCKET_SECONDS);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::No, &(5 * USDC), &0);
+        assert_eq!(
+            f.treasury.daily_headroom(),
+            60 * USDC - f.treasury.daily_usage().amount
+        );
+        assert_eq!(f.treasury.daily_headroom(), 35 * USDC);
+    }
+
+    /// Randomized schedule (an LCG, as in market-core's math property tests)
+    /// of 2_000 attempted trades over 30 days against the window logic
+    /// itself. After every accepted trade the true usage over the trailing
+    /// `(t - 86_400, t]` interval, brute-forced from a log, stays within cap.
+    #[test]
+    fn sliding_window_property_random_schedule() {
+        let env = Env::default();
+        env.cost_estimate().budget().reset_unlimited();
+        let max_daily: i128 = 1_000;
+        let mut window = Treasury::empty_window(&env, 0);
+        let mut log: std::vec::Vec<(u64, i128)> = std::vec::Vec::new();
+        let mut seed: u64 = 0x2545_F491_4F6C_DD1D;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            seed >> 33
+        };
+        let mut now: u64 = 0;
+        let mut accepted = 0;
+        for _ in 0..2_000 {
+            // Mostly short gaps (bursts), sometimes multi-hour ones.
+            now += if next() % 4 == 0 {
+                next() % (6 * BUCKET_SECONDS)
+            } else {
+                next() % 900
+            };
+            if now > 30 * DAY_SECONDS {
+                break;
+            }
+            let amount = 1 + (next() % 300) as i128;
+            if Treasury::consume_window(&mut window, now, amount, max_daily).is_ok() {
+                accepted += 1;
+                log.push((now, amount));
+                let trailing: i128 = log
+                    .iter()
+                    .filter(|(t, _)| *t + DAY_SECONDS > now)
+                    .map(|(_, a)| a)
+                    .sum();
+                assert!(trailing <= max_daily, "t={now}: {trailing} > {max_daily}");
+            }
+        }
+        assert!(accepted > 100, "schedule too sparse: {accepted}");
+    }
+
+    // ----- net exposure -----------------------------------------------------
+
+    fn net_fixture(max_net_exposure: i128) -> Fixture {
+        fixture_with_net_cap(150 * USDC, 300 * USDC, 300 * USDC, max_net_exposure)
+    }
+
+    fn agent_market(f: &Fixture, tag: u8) -> u64 {
+        f.treasury.agent_create_market(
+            &BytesN::from_array(&f.env, &[tag; 32]),
+            &BytesN::from_array(&f.env, &[tag.wrapping_add(100); 32]),
+            &String::from_str(&f.env, "ipfs://net"),
+            &Category::Macro,
+            &MARKET_CLOSE,
+            &(100 * USDC),
+            &5000u32,
+        )
+    }
+
+    #[test]
+    fn net_cap_blocks_buy_when_total_deployed_exceeds_limit() {
+        let f = fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 30 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let other = extra_market(&f, 23);
+        // Within every lifetime/daily cap, but 20 + 11 > 30 deployed.
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&other, &Outcome::Yes, &(11 * USDC), &0),
+            Err(Ok(Error::NetExposureExceeded))
+        );
+        f.treasury
+            .agent_buy(&other, &Outcome::Yes, &(10 * USDC), &0);
+        assert_eq!(f.treasury.net_exposure(), 30 * USDC);
+        assert_eq!(f.treasury.get_net_cap(), 30 * USDC);
+    }
+
+    #[test]
+    fn net_cap_applies_to_market_creation() {
+        let f = fixture_with_net_cap(100 * USDC, 300 * USDC, 300 * USDC, 150 * USDC);
+        agent_market(&f, 24);
+        assert_eq!(f.treasury.net_exposure(), 100 * USDC);
+        assert_eq!(
+            f.treasury.try_agent_create_market(
+                &BytesN::from_array(&f.env, &[25; 32]),
+                &BytesN::from_array(&f.env, &[125; 32]),
+                &String::from_str(&f.env, "ipfs://net-2"),
+                &Category::Macro,
+                &MARKET_CLOSE,
+                &(100 * USDC),
+                &5000u32,
+            ),
+            Err(Ok(Error::NetExposureExceeded))
+        );
+    }
+
+    #[test]
+    fn sell_frees_net_headroom_but_not_lifetime_cap() {
+        let f = fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 30 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let quote = f
+            .market_core
+            .quote_sell(&f.market_id, &Outcome::Yes, &(5 * USDC));
+        f.treasury
+            .agent_sell(&f.market_id, &Outcome::Yes, &(5 * USDC), &quote);
+        assert_eq!(f.treasury.net_exposure(), 15 * USDC);
+        assert_eq!(
+            f.treasury.net_position(&f.market_id),
+            NetPosition {
+                collateral_in: 20 * USDC,
+                collateral_out: 5 * USDC
+            }
+        );
+
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(15 * USDC), &0);
+        assert_eq!(f.treasury.net_exposure(), 30 * USDC);
+        let exposure = f.env.as_contract(&f.treasury_id, || {
+            Treasury::market_exposure(&f.env, f.market_id)
+        });
+        // The lifetime cap counts the sold capital too.
+        assert_eq!(exposure.amount, 35 * USDC);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&f.market_id, &Outcome::Yes, &USDC, &0),
+            Err(Ok(Error::NetExposureExceeded))
+        );
+        // close_trade changes neither cap.
+        f.treasury.close_trade(&f.market_id);
+        assert_eq!(f.treasury.net_exposure(), 30 * USDC);
+    }
+
+    #[test]
+    fn redeem_and_claim_reduce_net_exposure() {
+        let f = net_fixture(300 * USDC);
+        let market_id = agent_market(&f, 26);
+        f.treasury
+            .agent_buy(&market_id, &Outcome::Yes, &(20 * USDC), &0);
+        assert_eq!(f.treasury.net_exposure(), 120 * USDC);
+
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&market_id, &Outcome::Yes);
+        let redeemed = f.treasury.redeem(&market_id);
+        let claimed = f.treasury.claim_pool_remainder(&market_id);
+        assert!(redeemed > 0 && claimed > 0);
+        assert_eq!(
+            f.treasury.net_position(&market_id),
+            NetPosition {
+                collateral_in: 120 * USDC,
+                collateral_out: redeemed + claimed
+            }
+        );
+        assert_eq!(
+            f.treasury.net_exposure(),
+            (120 * USDC - redeemed - claimed).max(0)
+        );
+    }
+
+    #[test]
+    fn profit_in_one_market_does_not_offset_another() {
+        let f = net_fixture(300 * USDC);
+        let other = extra_market(&f, 27);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.treasury
+            .agent_buy(&other, &Outcome::Yes, &(20 * USDC), &0);
+
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::Yes);
+        let payout = f.treasury.redeem(&f.market_id);
+        assert!(payout > 20 * USDC, "winning shares pay out at a profit");
+        assert_eq!(f.treasury.net_position(&f.market_id).collateral_out, payout);
+        // The profitable market floors at 0; the other keeps its 20.
+        assert_eq!(f.treasury.net_exposure(), 20 * USDC);
+    }
+
+    #[test]
+    fn valuation_floor_counts_complete_sets_and_lp_min_reserve() {
+        let f = net_fixture(300 * USDC);
+        let market_id = agent_market(&f, 28);
+        f.treasury
+            .agent_buy(&market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.treasury
+            .agent_buy(&market_id, &Outcome::No, &(10 * USDC), &0);
+
+        let position = f.market_core.get_position(&market_id, &f.treasury_id);
+        let market = f.market_core.get_market(&market_id);
+        let floor = position.yes.min(position.no) + market.reserve_yes.min(market.reserve_no);
+        let valuation = f.treasury.market_valuation(&market_id);
+        assert_eq!(valuation.cost_basis, 130 * USDC);
+        assert_eq!(valuation.floor_value, floor);
+        assert_eq!(valuation.at_risk, (130 * USDC - floor).max(0));
+        assert!(valuation.spot_value >= valuation.floor_value);
+    }
+
+    #[test]
+    fn spot_manipulation_does_not_change_enforced_headroom() {
+        let f = fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 30 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        let before = f.treasury.market_valuation(&f.market_id);
+
+        // A third party pumps YES hard.
+        let whale = Address::generate(&f.env);
+        StellarAssetClient::new(&f.env, &f.token).mint(&whale, &(500 * USDC));
+        f.market_core
+            .buy(&whale, &f.market_id, &Outcome::Yes, &(400 * USDC), &0);
+        let after = f.treasury.market_valuation(&f.market_id);
+        assert!(after.spot_value > before.spot_value);
+        assert_eq!(after.cost_basis, before.cost_basis);
+        assert_eq!(f.treasury.net_exposure(), 20 * USDC);
+
+        // Exactly the same 10 of headroom as before the pump.
+        let other = extra_market(&f, 29);
+        assert_eq!(
+            f.treasury
+                .try_agent_buy(&other, &Outcome::Yes, &(11 * USDC), &0),
+            Err(Ok(Error::NetExposureExceeded))
+        );
+        f.treasury
+            .agent_buy(&other, &Outcome::Yes, &(10 * USDC), &0);
+    }
+
+    #[test]
+    fn valuation_after_resolution_uses_settlement_semantics() {
+        let f = net_fixture(300 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::No, &(10 * USDC), &0);
+        let position = f.market_core.get_position(&f.market_id, &f.treasury_id);
+        let voided = extra_market(&f, 30);
+        f.treasury
+            .agent_buy(&voided, &Outcome::Yes, &(20 * USDC), &0);
+        let voided_position = f.market_core.get_position(&voided, &f.treasury_id);
+
+        f.env.ledger().set_timestamp(MARKET_CLOSE);
+        f.market_core.resolve(&f.market_id, &Outcome::No);
+        f.market_core.void_market(&voided);
+
+        let resolved = f.treasury.market_valuation(&f.market_id);
+        assert_eq!(resolved.floor_value, position.no);
+        assert_eq!(resolved.spot_value, position.no);
+        let void = f.treasury.market_valuation(&voided);
+        assert_eq!(
+            void.floor_value,
+            (voided_position.yes + voided_position.no) / 2
+        );
+        assert_eq!(void.spot_value, void.floor_value);
+    }
+
+    /// Stand-in market-core exposing only `buy`, which pulls the collateral
+    /// like the real one and returns one share per stroop. If `agent_buy`
+    /// made any other market-core call (a valuation read on the hot path),
+    /// it would fail against this contract.
+    #[contract]
+    struct BuyOnlyMarketCore;
+
+    #[contractimpl]
+    impl BuyOnlyMarketCore {
+        pub fn set_token(env: Env, token: Address) {
+            env.storage().instance().set(&0u32, &token);
+        }
+
+        pub fn calls(env: Env) -> u32 {
+            env.storage().instance().get(&1u32).unwrap_or(0)
+        }
+
+        pub fn buy(
+            env: Env,
+            trader: Address,
+            _market_id: u64,
+            _outcome: Outcome,
+            collateral_in: i128,
+            _min_shares_out: i128,
+        ) -> i128 {
+            trader.require_auth();
+            let token: Address = env.storage().instance().get(&0u32).unwrap();
+            soroban_sdk::token::TokenClient::new(&env, &token).transfer(
+                &trader,
+                env.current_contract_address(),
+                &collateral_in,
+            );
+            let calls = Self::calls(env.clone());
+            env.storage().instance().set(&1u32, &(calls + 1));
+            collateral_in
+        }
+    }
+
+    #[test]
+    fn agent_buy_hot_path_makes_no_extra_cross_contract_reads() {
+        let f = fixture();
+        let proxy_id = f.env.register(BuyOnlyMarketCore, ());
+        let proxy = BuyOnlyMarketCoreClient::new(&f.env, &proxy_id);
+        proxy.set_token(&f.token);
+        let config = f.treasury.get_config();
+        let treasury_id = f.env.register(
+            Treasury,
+            TreasuryArgs::__constructor(
+                &f.admin,
+                &config.agent,
+                &f.token,
+                &proxy_id,
+                &config.max_trade,
+                &config.max_market,
+                &config.max_daily,
+                &config.max_daily,
+            ),
+        );
+        StellarAssetClient::new(&f.env, &f.token).mint(&treasury_id, &(100 * USDC));
+        let treasury = TreasuryClient::new(&f.env, &treasury_id);
+
+        // Only the agent's call is mocked: the stub's token pull must be
+        // covered by the treasury's own pre-authorization, as in production.
+        f.env.set_auths(&[]);
+        let (agent, amount) = (config.agent.clone(), 20 * USDC);
+        f.env.cost_estimate().budget().reset_unlimited();
+        let shares = treasury
+            .mock_auths(&[MockAuth {
+                address: &agent,
+                invoke: &MockAuthInvoke {
+                    contract: &treasury_id,
+                    fn_name: "agent_buy",
+                    args: (f.market_id, Outcome::Yes, amount, 0_i128).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .agent_buy(&f.market_id, &Outcome::Yes, &amount, &0);
+        let used = f.env.cost_estimate().resources();
+        std::println!(
+            "agent_buy with net accounting: {} instructions, {} reads, {} writes",
+            used.instructions,
+            used.disk_read_entries,
+            used.write_entries
+        );
+        assert!(shares > 0);
+        assert_eq!(proxy.calls(), 1);
+        assert_eq!(treasury.net_exposure(), 20 * USDC);
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid risk configuration")]
+    fn constructor_rejects_net_cap_below_max_trade() {
+        fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
+    }
+
+    #[test]
+    fn migrate_market_clears_net_exposure() {
+        let f = net_fixture(300 * USDC);
+        f.treasury
+            .agent_buy(&f.market_id, &Outcome::Yes, &(20 * USDC), &0);
+        f.treasury.set_successor(&Address::generate(&f.env));
+        f.treasury.migrate_market(&f.market_id);
+        assert_eq!(f.treasury.net_exposure(), 0);
     }
 }

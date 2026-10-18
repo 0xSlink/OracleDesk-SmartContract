@@ -24,6 +24,9 @@ WASM_DIR=target/wasm32v1-none/release
 MAX_TRADE=${MAX_TRADE:-2000000000}   # 200 USDC
 MAX_MARKET=${MAX_MARKET:-5000000000} # 500 USDC
 MAX_DAILY=${MAX_DAILY:-10000000000}  # 1,000 USDC
+# Cap on capital deployed in open positions across all markets at once
+# (must be >= MAX_TRADE).
+MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
 DEFAULT_FEE_BPS=${DEFAULT_FEE_BPS:-100} # 1%
 # Portion of each fee kept by the protocol treasury (bps). The remainder
 # accrues to the market creator, claimable before resolution. 10000 = the
@@ -153,7 +156,8 @@ if [ -z "$TREASURY" ]; then
     --market_core "$MARKET_CORE" \
     --max_trade "$MAX_TRADE" \
     --max_market "$MAX_MARKET" \
-    --max_daily "$MAX_DAILY")
+    --max_daily "$MAX_DAILY" \
+    --max_net_exposure "$MAX_NET_EXPOSURE")
   json_set --arg id "$TREASURY" '.contracts.treasury = $id'
   json_set '.needs_treasury_wiring = true'
 else
