@@ -2,7 +2,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, String,
+    Env, String, Symbol, Vec,
 };
 
 /// Domain tag for commit-reveal commitments (#51). Must match
@@ -11,6 +11,38 @@ pub const COMMIT_DOMAIN_TAG: &[u8] = b"oracledesk.trace.commit.v1";
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum AgentStatus {
+    Active,
+    Retired(u64),
+    Revoked(u64, Symbol),
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRecord {
+    pub status: AgentStatus,
+    pub registered_at: u64,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceFlag {
+    pub reason: Symbol,
+    pub flagged_at: u64,
+    pub active: bool,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceVerdict {
+    Valid,
+    HashMismatch,
+    Flagged(Symbol),
+    AgentRevokedAfter(u64),
+}
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -47,6 +79,12 @@ pub enum DataKey {
     AgentTrace(Address, u64),
     /// `trace_id -> ChainLink`; absent for legacy traces (#52).
     TraceLink(u64),
+    /// Active trace flag annotation (#56).
+    Flag(u64),
+    /// Number of flag history entries for a trace (#56).
+    FlagHistoryCount(u64),
+    /// Flag history entries: (trace_id, index) -> TraceFlag (#56).
+    FlagHistory(u64, u32),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -83,6 +121,54 @@ pub enum Error {
     ChainedAgentMustChain = 9,
     /// Trace already backed an action (#50).
     TraceAlreadyConsumed = 10,
+    /// Agent is retired or revoked (#56).
+    AgentNotActive = 11,
+    /// A revoked agent cannot be reactivated (#56).
+    CannotReactivateRevoked = 12,
+    /// Trace flag history exceeds maximum 16 entries (#56).
+    FlagHistoryFull = 13,
+    /// Revocation effective_from is invalid (#56).
+    InvalidEffectiveTime = 14,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRetired {
+    #[topic]
+    pub agent: Address,
+    pub at: u64,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentRevoked {
+    #[topic]
+    pub agent: Address,
+    pub effective_from: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentReactivated {
+    #[topic]
+    pub agent: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceFlagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceUnflagged {
+    #[topic]
+    pub trace_id: u64,
+    pub reason: Symbol,
 }
 
 #[contractevent]
@@ -153,30 +239,77 @@ impl ReasoningRegistry {
 
     pub fn register_agent(env: Env, agent: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let key = DataKey::Agent(agent.clone());
-        if env.storage().persistent().has(&key) {
+        if Self::load_agent(&env, &agent).is_some() {
             return Err(Error::AgentAlreadyRegistered);
         }
-        env.storage().persistent().set(&key, &true);
-        env.storage()
-            .persistent()
-            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        let now = env.ledger().timestamp();
+        let record = AgentRecord {
+            status: AgentStatus::Active,
+            registered_at: now,
+        };
+        Self::put(&env, &DataKey::Agent(agent.clone()), &record);
         AgentRegistered { agent }.publish(&env);
         Ok(())
     }
 
-    pub fn unregister_agent(env: Env, agent: Address) -> Result<(), Error> {
+    pub fn retire_agent(env: Env, agent: Address) -> Result<(), Error> {
         Self::require_admin(&env)?;
-        let key = DataKey::Agent(agent);
-        if !env.storage().persistent().has(&key) {
-            return Err(Error::AgentNotRegistered);
+        Self::retire_agent_internal(&env, agent)
+    }
+
+    pub fn retire_self(env: Env, agent: Address) -> Result<(), Error> {
+        agent.require_auth();
+        Self::retire_agent_internal(&env, agent)
+    }
+
+    pub fn reactivate_agent(env: Env, agent: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
+        match record.status {
+            AgentStatus::Retired(_) => {
+                record.status = AgentStatus::Active;
+                Self::put(&env, &DataKey::Agent(agent.clone()), &record);
+                AgentReactivated { agent }.publish(&env);
+                Ok(())
+            }
+            AgentStatus::Revoked(_, _) => Err(Error::CannotReactivateRevoked),
+            AgentStatus::Active => Err(Error::AgentAlreadyRegistered),
         }
-        env.storage().persistent().remove(&key);
+    }
+
+    pub fn revoke_agent(
+        env: Env,
+        agent: Address,
+        effective_from: u64,
+        reason: Symbol,
+    ) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        let mut record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
+        let now = env.ledger().timestamp();
+        if effective_from < record.registered_at || effective_from > now {
+            return Err(Error::InvalidEffectiveTime);
+        }
+        record.status = AgentStatus::Revoked(effective_from, reason.clone());
+        Self::put(&env, &DataKey::Agent(agent.clone()), &record);
+        AgentRevoked {
+            agent,
+            effective_from,
+            reason,
+        }
+        .publish(&env);
         Ok(())
     }
 
+    pub fn unregister_agent(env: Env, agent: Address) -> Result<(), Error> {
+        Self::retire_agent(env, agent)
+    }
+
     pub fn is_registered(env: Env, agent: Address) -> bool {
-        env.storage().persistent().has(&DataKey::Agent(agent))
+        Self::load_agent(&env, &agent).map_or(false, |r| matches!(r.status, AgentStatus::Active))
+    }
+
+    pub fn get_agent(env: Env, agent: Address) -> Option<AgentRecord> {
+        Self::load_agent(&env, &agent)
     }
 
     pub fn publish_trace(
@@ -356,9 +489,108 @@ impl ReasoningRegistry {
         Ok(trace)
     }
 
+    pub fn flag_trace(env: Env, trace_id: u64, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::get_trace(env.clone(), trace_id)?;
+        let count_key = DataKey::FlagHistoryCount(trace_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count >= 16 {
+            return Err(Error::FlagHistoryFull);
+        }
+        let now = env.ledger().timestamp();
+        let flag = TraceFlag {
+            reason: reason.clone(),
+            flagged_at: now,
+            active: true,
+        };
+        Self::put(&env, &DataKey::Flag(trace_id), &flag);
+        Self::put(&env, &DataKey::FlagHistory(trace_id, count), &flag);
+        Self::put(&env, &count_key, &(count + 1));
+        TraceFlagged { trace_id, reason }.publish(&env);
+        Ok(())
+    }
+
+    pub fn unflag_trace(env: Env, trace_id: u64, reason: Symbol) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        Self::get_trace(env.clone(), trace_id)?;
+        let count_key = DataKey::FlagHistoryCount(trace_id);
+        let count: u32 = env.storage().persistent().get(&count_key).unwrap_or(0);
+        if count >= 16 {
+            return Err(Error::FlagHistoryFull);
+        }
+        let now = env.ledger().timestamp();
+        let flag = TraceFlag {
+            reason: reason.clone(),
+            flagged_at: now,
+            active: false,
+        };
+        Self::put(&env, &DataKey::Flag(trace_id), &flag);
+        Self::put(&env, &DataKey::FlagHistory(trace_id, count), &flag);
+        Self::put(&env, &count_key, &(count + 1));
+        TraceUnflagged { trace_id, reason }.publish(&env);
+        Ok(())
+    }
+
+    pub fn trace_flags(
+        env: Env,
+        trace_id: u64,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<TraceFlag>, Error> {
+        Self::get_trace(env.clone(), trace_id)?;
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&DataKey::FlagHistoryCount(trace_id))
+            .unwrap_or(0);
+        let mut list = Vec::new(&env);
+        let end = (start + limit).min(count);
+        for i in start..end {
+            if let Some(flag) = env
+                .storage()
+                .persistent()
+                .get::<_, TraceFlag>(&DataKey::FlagHistory(trace_id, i))
+            {
+                list.push_back(flag);
+            }
+        }
+        Ok(list)
+    }
+
+    pub fn get_trace_flag(env: Env, trace_id: u64) -> Option<TraceFlag> {
+        env.storage().persistent().get(&DataKey::Flag(trace_id))
+    }
+
+    pub fn trace_verdict(
+        env: Env,
+        trace_id: u64,
+        received_hash: BytesN<32>,
+    ) -> Result<TraceVerdict, Error> {
+        let trace = Self::get_trace(env.clone(), trace_id)?;
+        if trace.trace_hash != received_hash {
+            return Ok(TraceVerdict::HashMismatch);
+        }
+        if let Some(flag) = env
+            .storage()
+            .persistent()
+            .get::<_, TraceFlag>(&DataKey::Flag(trace_id))
+        {
+            if flag.active {
+                return Ok(TraceVerdict::Flagged(flag.reason));
+            }
+        }
+        if let Some(record) = Self::load_agent(&env, &trace.agent) {
+            if let AgentStatus::Revoked(effective_from, _) = record.status {
+                if trace.published_at >= effective_from {
+                    return Ok(TraceVerdict::AgentRevokedAfter(effective_from));
+                }
+            }
+        }
+        Ok(TraceVerdict::Valid)
+    }
+
     pub fn verify_trace(env: Env, trace_id: u64, received_hash: BytesN<32>) -> Result<bool, Error> {
-        let trace = Self::get_trace(env, trace_id)?;
-        Ok(trace.trace_hash == received_hash)
+        Ok(Self::trace_verdict(env, trace_id, received_hash)? == TraceVerdict::Valid)
     }
 
     pub fn trace_count(env: Env) -> u64 {
@@ -383,6 +615,42 @@ impl ReasoningRegistry {
 }
 
 impl ReasoningRegistry {
+    fn retire_agent_internal(env: &Env, agent: Address) -> Result<(), Error> {
+        let mut record = Self::load_agent(env, &agent).ok_or(Error::AgentNotRegistered)?;
+        if matches!(record.status, AgentStatus::Revoked(_, _)) {
+            return Err(Error::CannotReactivateRevoked);
+        }
+        let now = env.ledger().timestamp();
+        record.status = AgentStatus::Retired(now);
+        Self::put(env, &DataKey::Agent(agent.clone()), &record);
+        AgentRetired { agent, at: now }.publish(env);
+        Ok(())
+    }
+
+    fn load_agent(env: &Env, addr: &Address) -> Option<AgentRecord> {
+        let key = DataKey::Agent(addr.clone());
+        if let Some(record) = env.storage().persistent().get::<_, AgentRecord>(&key) {
+            env.storage()
+                .persistent()
+                .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+            Some(record)
+        } else if let Some(is_reg) = env.storage().persistent().get::<_, bool>(&key) {
+            if is_reg {
+                env.storage()
+                    .persistent()
+                    .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+                Some(AgentRecord {
+                    status: AgentStatus::Active,
+                    registered_at: 0,
+                })
+            } else {
+                None
+            }
+        } else {
+            None
+        }
+    }
+
     fn check_publish(
         env: &Env,
         agent: &Address,
@@ -390,12 +658,9 @@ impl ReasoningRegistry {
         ipfs_cid: &String,
     ) -> Result<(), Error> {
         agent.require_auth();
-        if !env
-            .storage()
-            .persistent()
-            .has(&DataKey::Agent(agent.clone()))
-        {
-            return Err(Error::AgentNotRegistered);
+        let record = Self::load_agent(env, agent).ok_or(Error::AgentNotRegistered)?;
+        if !matches!(record.status, AgentStatus::Active) {
+            return Err(Error::AgentNotActive);
         }
         if action.is_empty() {
             return Err(Error::EmptyAction);
@@ -545,6 +810,9 @@ mod test {
 
         client.unregister_agent(&agent);
         assert!(!client.is_registered(&agent));
+        let record = client.get_agent(&agent).unwrap();
+        assert!(matches!(record.status, AgentStatus::Retired(_)));
+        assert!(client.verify_trace(&trace_id, &trace_hash));
         let _ = admin;
     }
 
@@ -970,5 +1238,330 @@ mod test {
             &BytesN::from_array(&env, &[8u8; 32]),
             &BytesN::from_array(&env, &expected)
         ));
+    }
+
+    // ── #56 Trace lifecycle: retirement, revocation, and flagging ─────────
+
+    #[test]
+    fn retired_agent_cannot_publish_but_old_traces_valid() {
+        let (env, client, admin, agent) = setup();
+        client.register_agent(&agent);
+
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        client.retire_agent(&agent);
+        assert!(!client.is_registered(&agent));
+
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &1,
+                &String::from_str(&env, "trade"),
+                &BytesN::from_array(&env, &[2u8; 32]),
+                &String::from_str(&env, "ipfs://t2"),
+            ),
+            Err(Ok(Error::AgentNotActive))
+        );
+
+        assert_eq!(
+            client.trace_verdict(&trace_id, &trace_hash),
+            TraceVerdict::Valid
+        );
+        assert!(client.verify_trace(&trace_id, &trace_hash));
+
+        client.reactivate_agent(&agent);
+        assert!(client.is_registered(&agent));
+        let trace_id2 = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &BytesN::from_array(&env, &[3u8; 32]),
+            &String::from_str(&env, "ipfs://t3"),
+        );
+        assert_eq!(trace_id2, 1);
+        let _ = admin;
+    }
+
+    #[test]
+    fn revoked_agent_traces_after_effective_time_report_revoked() {
+        let (env, client, _admin, agent) = setup();
+        env.ledger().set_timestamp(100);
+        client.register_agent(&agent);
+
+        env.ledger().set_timestamp(200);
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        env.ledger().set_timestamp(300);
+        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
+
+        assert_eq!(
+            client.trace_verdict(&trace_id, &trace_hash),
+            TraceVerdict::AgentRevokedAfter(150)
+        );
+        assert!(!client.verify_trace(&trace_id, &trace_hash));
+    }
+
+    #[test]
+    fn revoked_agent_traces_before_effective_time_remain_valid() {
+        let (env, client, _admin, agent) = setup();
+        env.ledger().set_timestamp(100);
+        client.register_agent(&agent);
+
+        env.ledger().set_timestamp(120);
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        env.ledger().set_timestamp(200);
+        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
+
+        assert_eq!(
+            client.trace_verdict(&trace_id, &trace_hash),
+            TraceVerdict::Valid
+        );
+        assert!(client.verify_trace(&trace_id, &trace_hash));
+    }
+
+    #[test]
+    fn revoked_agent_cannot_be_reregistered_or_reactivated() {
+        let (env, client, _admin, agent) = setup();
+        env.ledger().set_timestamp(100);
+        client.register_agent(&agent);
+        env.ledger().set_timestamp(200);
+        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
+
+        assert_eq!(
+            client.try_register_agent(&agent),
+            Err(Ok(Error::AgentAlreadyRegistered))
+        );
+        assert_eq!(
+            client.try_reactivate_agent(&agent),
+            Err(Ok(Error::CannotReactivateRevoked))
+        );
+    }
+
+    #[test]
+    fn flag_and_unflag_append_history_never_mutate_trace() {
+        let (env, client, _admin, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        let initial_trace = client.get_trace(&trace_id);
+
+        client.flag_trace(&trace_id, &Symbol::new(&env, "suspicious"));
+        assert_eq!(
+            client.trace_verdict(&trace_id, &trace_hash),
+            TraceVerdict::Flagged(Symbol::new(&env, "suspicious"))
+        );
+
+        assert_eq!(client.get_trace(&trace_id), initial_trace);
+
+        client.unflag_trace(&trace_id, &Symbol::new(&env, "cleared"));
+        assert_eq!(
+            client.trace_verdict(&trace_id, &trace_hash),
+            TraceVerdict::Valid
+        );
+
+        assert_eq!(client.get_trace(&trace_id), initial_trace);
+
+        let flags = client.trace_flags(&trace_id, &0, &10);
+        assert_eq!(flags.len(), 2);
+        assert!(flags.get(0).unwrap().active);
+        assert_eq!(flags.get(0).unwrap().reason, Symbol::new(&env, "suspicious"));
+        assert!(!flags.get(1).unwrap().active);
+        assert_eq!(flags.get(1).unwrap().reason, Symbol::new(&env, "cleared"));
+    }
+
+    #[test]
+    fn flag_history_is_bounded() {
+        let (env, client, _admin, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        for _ in 0..8 {
+            client.flag_trace(&trace_id, &Symbol::new(&env, "flag"));
+            client.unflag_trace(&trace_id, &Symbol::new(&env, "unflag"));
+        }
+
+        assert_eq!(
+            client.try_flag_trace(&trace_id, &Symbol::new(&env, "flag17")),
+            Err(Ok(Error::FlagHistoryFull))
+        );
+    }
+
+    #[test]
+    fn verify_trace_false_for_flagged_trace() {
+        let (env, client, _admin, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &1,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://t1"),
+        );
+
+        assert!(client.verify_trace(&trace_id, &trace_hash));
+        client.flag_trace(&trace_id, &Symbol::new(&env, "fraud"));
+        assert!(!client.verify_trace(&trace_id, &trace_hash));
+    }
+
+    #[test]
+    fn legacy_bool_agent_record_reads_as_active() {
+        let (env, client, _admin, agent) = setup();
+        env.as_contract(&client.address, || {
+            env.storage()
+                .persistent()
+                .set(&DataKey::Agent(agent.clone()), &true);
+        });
+        assert!(client.is_registered(&agent));
+        let record = client.get_agent(&agent).unwrap();
+        assert_eq!(record.status, AgentStatus::Active);
+        assert_eq!(record.registered_at, 0);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_flag_or_revoke() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let agent = Address::generate(&env);
+        let contract_id = env.register(
+            ReasoningRegistry,
+            ReasoningRegistryArgs::__constructor(&admin),
+        );
+        let client = ReasoningRegistryClient::new(&env, &contract_id);
+
+        env.mock_auths(&[MockAuth {
+            address: &admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "register_agent",
+                args: (&agent,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.register_agent(&agent);
+
+        let trace_hash = BytesN::from_array(&env, &[7u8; 32]);
+        env.mock_auths(&[MockAuth {
+            address: &agent,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "publish_trace",
+                args: (
+                    &agent,
+                    &42u64,
+                    &String::from_str(&env, "trade"),
+                    &trace_hash,
+                    &String::from_str(&env, "ipfs://trace-42"),
+                )
+                    .into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &42,
+            &String::from_str(&env, "trade"),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-42"),
+        );
+
+        let non_admin = Address::generate(&env);
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "flag_trace",
+                args: (&trace_id, &Symbol::new(&env, "bad_trade")).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_flag_trace(&trace_id, &Symbol::new(&env, "bad_trade")).is_err());
+
+        env.mock_auths(&[MockAuth {
+            address: &non_admin,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "revoke_agent",
+                args: (&agent, &0u64, &Symbol::new(&env, "compromised")).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_revoke_agent(&agent, &0u64, &Symbol::new(&env, "compromised")).is_err());
+    }
+
+    #[test]
+    fn agent_can_retire_itself_but_not_others() {
+        let env = Env::default();
+        let admin = Address::generate(&env);
+        let agent1 = Address::generate(&env);
+        let agent2 = Address::generate(&env);
+        let contract_id = env.register(
+            ReasoningRegistry,
+            ReasoningRegistryArgs::__constructor(&admin),
+        );
+        let client = ReasoningRegistryClient::new(&env, &contract_id);
+
+        env.mock_all_auths();
+        client.register_agent(&agent1);
+        client.register_agent(&agent2);
+
+        env.mock_auths(&[MockAuth {
+            address: &agent1,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "retire_self",
+                args: (&agent1,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        client.retire_self(&agent1);
+        assert!(!client.is_registered(&agent1));
+
+        env.mock_auths(&[MockAuth {
+            address: &agent1,
+            invoke: &MockAuthInvoke {
+                contract: &client.address,
+                fn_name: "retire_self",
+                args: (&agent2,).into_val(&env),
+                sub_invokes: &[],
+            },
+        }]);
+        assert!(client.try_retire_self(&agent2).is_err());
     }
 }

@@ -23,6 +23,10 @@ contracts and `deployments/testnet.json` predate these changes, so the new
 entrypoints have contract-level and off-chain tests only, not a real-ledger
 transaction.
 
+### Storage Migration: Reasoning Registry Agent Records (#56)
+
+Existing deployments store `true` under `Agent(addr)`. The registry reads both `AgentRecord` and legacy `bool` seamlessly (treating legacy bool records as `AgentStatus::Active` with `registered_at: 0`); newly registered agents write full `AgentRecord` structs.
+
 ### Merge follow-up: 2026-10-17
 
 The work above landed on `develop` as merge commit `581a3ec` (PR #153,

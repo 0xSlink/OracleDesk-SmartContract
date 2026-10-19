@@ -439,6 +439,22 @@ trusting fetched trace content. Traces are also indexed per market
 (`market_trace_count` / `market_trace_at`) via a counter rather than an
 unbounded `Vec`, so the index never has an unbounded-growth storage cost.
 
+#### Agent Lifecycle and Trace Annotations (#56)
+
+The reasoning registry models an explicit lifecycle for agents and traces:
+- **Agent lifecycle**: Agents hold `AgentRecord { status: AgentStatus, registered_at: u64 }`.
+  - `Active`: Registered agent permitted to publish traces.
+  - `Retired(at)`: Agent gracefully retired by admin (`retire_agent`) or the agent itself (`retire_self`). Retired agents cannot publish new traces, but their existing traces remain valid. Admin may call `reactivate_agent` to return a retired agent to `Active`.
+  - `Revoked(effective_from, reason)`: Agent revoked by admin (`revoke_agent`) due to compromise or malfeasance. Revocations cannot be reversed or reactivated, preventing history laundering.
+- **Trace flagging**: The admin can annotate suspect traces via `flag_trace(trace_id, reason)` and `unflag_trace(trace_id, reason)`. Flags are annotations appended to a bounded history (max 16 entries) and never modify or erase the underlying trace data.
+- **Trace verdict**: `trace_verdict(trace_id, received_hash)` evaluates validity in strict precedence:
+  1. Not found -> `Err(TraceNotFound)`
+  2. Hash differs -> `TraceVerdict::HashMismatch`
+  3. Active flag -> `TraceVerdict::Flagged(reason)`
+  4. Agent revoked with `trace.published_at >= effective_from` -> `TraceVerdict::AgentRevokedAfter(effective_from)`
+  5. Otherwise -> `TraceVerdict::Valid`
+- **Semantic tightening of `verify_trace`**: `verify_trace` returns `true` only if `trace_verdict` evaluates to `TraceVerdict::Valid`. Clients wishing to perform bare hash comparison without status checks can query `get_trace`.
+
 **Known limitation**: Soroban RPC only retains a short window of historical
 events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is

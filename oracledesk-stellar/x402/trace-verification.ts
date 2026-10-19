@@ -1,9 +1,16 @@
 import { createHash } from "node:crypto";
 
+export type TraceVerdict =
+  | { tag: "Valid"; values?: void }
+  | { tag: "HashMismatch"; values?: void }
+  | { tag: "Flagged"; values: [string] | readonly [string] }
+  | { tag: "AgentRevokedAfter"; values: [bigint] | readonly [bigint] };
+
 export interface TraceRecord {
   traceId: string;
   ipfsCid: string;
   traceHash: string;
+  verdict?: TraceVerdict;
 }
 
 export function sha256Hex(content: Uint8Array): string {

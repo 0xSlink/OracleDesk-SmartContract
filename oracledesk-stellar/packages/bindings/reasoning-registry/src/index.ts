@@ -40,9 +40,37 @@ export const Errors = {
   4: {message:"AgentNotRegistered"},
   5: {message:"TraceNotFound"},
   6: {message:"EmptyAction"},
-  7: {message:"EmptyCid"}
+  7: {message:"EmptyCid"},
+  8: {message:"ChainHeadMismatch"},
+  9: {message:"ChainedAgentMustChain"},
+  10: {message:"TraceAlreadyConsumed"},
+  11: {message:"AgentNotActive"},
+  12: {message:"CannotReactivateRevoked"},
+  13: {message:"FlagHistoryFull"},
+  14: {message:"InvalidEffectiveTime"}
 }
 
+export type AgentStatus =
+  | { tag: "Active", values: void }
+  | { tag: "Retired", values: readonly [u64] }
+  | { tag: "Revoked", values: readonly [u64, string] };
+
+export interface AgentRecord {
+  registered_at: u64;
+  status: AgentStatus;
+}
+
+export interface TraceFlag {
+  active: boolean;
+  flagged_at: u64;
+  reason: string;
+}
+
+export type TraceVerdict =
+  | { tag: "Valid", values: void }
+  | { tag: "HashMismatch", values: void }
+  | { tag: "Flagged", values: readonly [string] }
+  | { tag: "AgentRevokedAfter", values: readonly [u64] };
 
 export interface Trace {
   action: string;
@@ -53,58 +81,37 @@ export interface Trace {
   trace_hash: Buffer;
 }
 
-export type DataKey = {tag: "Admin", values: void} | {tag: "NextId", values: void} | {tag: "Agent", values: readonly [string]} | {tag: "Trace", values: readonly [u64]} | {tag: "MarketTraceCount", values: readonly [u64]} | {tag: "MarketTrace", values: readonly [u64, u64]};
-
-
+export type DataKey =
+  | {tag: "Admin", values: void}
+  | {tag: "NextId", values: void}
+  | {tag: "Agent", values: readonly [string]}
+  | {tag: "Trace", values: readonly [u64]}
+  | {tag: "MarketTraceCount", values: readonly [u64]}
+  | {tag: "MarketTrace", values: readonly [u64, u64]}
+  | {tag: "Flag", values: readonly [u64]}
+  | {tag: "FlagHistoryCount", values: readonly [u64]}
+  | {tag: "FlagHistory", values: readonly [u64, u32]};
 
 export interface Client {
-  /**
-   * Construct and simulate a get_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
   get_trace: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Trace>>>
-
-  /**
-   * Construct and simulate a trace_count transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
   trace_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
-
-  /**
-   * Construct and simulate a verify_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
   verify_trace: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
-
-  /**
-   * Construct and simulate a is_registered transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
+  trace_verdict: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TraceVerdict>>>
   is_registered: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
-
-  /**
-   * Construct and simulate a publish_trace transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
+  get_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Option<AgentRecord>>>
   publish_trace: ({agent, market_id, action, trace_hash, ipfs_cid}: {agent: string, market_id: u64, action: string, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
-
-  /**
-   * Construct and simulate a register_agent transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
   register_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
-
-  /**
-   * Construct and simulate a market_trace_at transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * The `index`-th (0-based, publish order) trace id for `market_id`.
-   */
+  retire_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  retire_self: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  reactivate_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  revoke_agent: ({agent, effective_from, reason}: {agent: string, effective_from: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  flag_trace: ({trace_id, reason}: {trace_id: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  unflag_trace: ({trace_id, reason}: {trace_id: u64, reason: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  trace_flags: ({trace_id, start, limit}: {trace_id: u64, start: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Array<TraceFlag>>>>
+  get_trace_flag: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<TraceFlag>>>
   market_trace_at: ({market_id, index}: {market_id: u64, index: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
-
-  /**
-   * Construct and simulate a unregister_agent transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   */
   unregister_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
-
-  /**
-   * Construct and simulate a market_trace_count transaction. Returns an `AssembledTransaction` object which will have a `result` field containing the result of the simulation. If this transaction changes contract state, you will need to call `signAndSend()` on the returned object.
-   * Number of traces published for `market_id`.
-   */
   market_trace_count: ({market_id}: {market_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<u64>>
-
 }
 export class Client extends ContractClient {
   static async deploy<T = Client>(
@@ -145,13 +152,23 @@ export class Client extends ContractClient {
   }
   public readonly fromJSON = {
     get_trace: this.txFromJSON<Result<Trace>>,
-        trace_count: this.txFromJSON<u64>,
-        verify_trace: this.txFromJSON<Result<boolean>>,
-        is_registered: this.txFromJSON<boolean>,
-        publish_trace: this.txFromJSON<Result<u64>>,
-        register_agent: this.txFromJSON<Result<void>>,
-        market_trace_at: this.txFromJSON<Result<u64>>,
-        unregister_agent: this.txFromJSON<Result<void>>,
-        market_trace_count: this.txFromJSON<u64>
+    trace_count: this.txFromJSON<u64>,
+    verify_trace: this.txFromJSON<Result<boolean>>,
+    trace_verdict: this.txFromJSON<Result<TraceVerdict>>,
+    is_registered: this.txFromJSON<boolean>,
+    get_agent: this.txFromJSON<Option<AgentRecord>>,
+    publish_trace: this.txFromJSON<Result<u64>>,
+    register_agent: this.txFromJSON<Result<void>>,
+    retire_agent: this.txFromJSON<Result<void>>,
+    retire_self: this.txFromJSON<Result<void>>,
+    reactivate_agent: this.txFromJSON<Result<void>>,
+    revoke_agent: this.txFromJSON<Result<void>>,
+    flag_trace: this.txFromJSON<Result<void>>,
+    unflag_trace: this.txFromJSON<Result<void>>,
+    trace_flags: this.txFromJSON<Result<Array<TraceFlag>>>,
+    get_trace_flag: this.txFromJSON<Option<TraceFlag>>,
+    market_trace_at: this.txFromJSON<Result<u64>>,
+    unregister_agent: this.txFromJSON<Result<void>>,
+    market_trace_count: this.txFromJSON<u64>
   }
 }

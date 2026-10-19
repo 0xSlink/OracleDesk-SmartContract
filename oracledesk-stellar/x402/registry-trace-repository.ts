@@ -12,6 +12,9 @@
  */
 
 import type { TraceRecord, TraceRepository } from "./trace-api.js";
+import type { TraceVerdict } from "./trace-verification.js";
+
+export type { TraceVerdict };
 
 export interface RegistryTrace {
   market_id: bigint;
@@ -24,6 +27,7 @@ export interface RegistryTrace {
 
 export interface RegistryTraceReader {
   get_trace(args: { trace_id: bigint }): Promise<{ result: RegistryTrace }>;
+  trace_verdict?(args: { trace_id: bigint; received_hash: Buffer }): Promise<{ result: TraceVerdict }>;
 }
 
 export class RegistryTraceRepository implements TraceRepository {
@@ -38,10 +42,23 @@ export class RegistryTraceRepository implements TraceRepository {
     }
     try {
       const { result } = await this.reader.get_trace({ trace_id: id });
+      let verdict: TraceVerdict | undefined = undefined;
+      if (typeof this.reader.trace_verdict === "function") {
+        try {
+          const verdictRes = await this.reader.trace_verdict({
+            trace_id: id,
+            received_hash: result.trace_hash,
+          });
+          verdict = verdictRes.result;
+        } catch {
+          // Contract-level error or method unavailable
+        }
+      }
       return {
         traceId,
         ipfsCid: result.ipfs_cid,
         traceHash: result.trace_hash.toString("hex"),
+        verdict,
       };
     } catch {
       // Contract-level TraceNotFound, or any RPC failure: treat as "no
