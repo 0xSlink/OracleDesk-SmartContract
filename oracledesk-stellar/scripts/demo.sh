@@ -54,7 +54,7 @@ EOF
 TRACE_HASH=$(python3 -c "import hashlib,sys; print(hashlib.sha256(open(sys.argv[1],'rb').read()).hexdigest())" "$TRACE_JSON")
 echo "trace hash: $TRACE_HASH"
 TRACE_ID=$(invoke "$REGISTRY" "$AGENT_KEY" publish_trace \
-  --agent "$AGENT" --market_id "$MARKET_ID" --action '"create_market"' \
+  --agent "$AGENT" --market_id "$MARKET_ID" --action CreateMarket \
   --trace_hash "$TRACE_HASH" --ipfs_cid '"ipfs://demo-trace-placeholder"')
 echo "trace id: $TRACE_ID"
 echo

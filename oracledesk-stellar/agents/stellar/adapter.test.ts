@@ -155,3 +155,27 @@ test("dry-run agentSellV2 describes the bounded call without touching the networ
     assert.equal(result.method, "agent_sell_v2");
   }
 });
+
+test("dry-run publishTrace passes u64::MAX sentinel exactly", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  const U64_MAX = 18446744073709551615n;
+  const result = await adapter.publishTrace({
+    agent: "GAGENT",
+    market_id: U64_MAX,
+    action: { tag: "ProposeMarket", values: undefined },
+    trace_hash: Buffer.alloc(32, 1),
+    ipfs_cid: "ipfs://propose",
+  });
+  assert.equal(result.dryRun, true);
+  if (result.dryRun) {
+    assert.equal(result.contractId, "CREGISTRY");
+    assert.equal(result.method, "publish_trace");
+    assert.equal((result.args as any).market_id, U64_MAX);
+    assert.deepEqual((result.args as any).action, { tag: "ProposeMarket", values: undefined });
+  }
+});

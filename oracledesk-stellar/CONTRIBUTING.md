@@ -45,8 +45,9 @@ Contract changes need:
   `mock_auths` for a specific *other* address, not `mock_all_auths`, which
   would hide a missing `require_auth`).
 - If the change touches `market-core`, rebuild its wasm and re-copy it into
-  `contracts/resolver/market_core.wasm` and
-  `contracts/treasury/market_core.wasm` before those crates will see the
+  `contracts/resolver/market_core.wasm`,
+  `contracts/treasury/market_core.wasm`, and
+  `contracts/reasoning-registry/market_core.wasm` before those crates will see the
   change — `make build` does this in the right order automatically; running
   `cargo build -p resolver` on its own after touching market-core will
   silently build against the stale copy. See
@@ -68,8 +69,8 @@ Contract changes need:
 - [ ] `cargo test --workspace` passes.
 - [ ] If you touched contract interfaces, bindings were regenerated
       (`make bindings`) and the diff is included.
-- [ ] If you touched `market-core`'s interface, `resolver`'s and
-      `treasury`'s vendored `market_core.wasm` copies were refreshed.
+- [ ] If you touched `market-core`'s interface, `resolver`'s,
+      `treasury`'s, and `reasoning-registry`'s vendored `market_core.wasm` copies were refreshed.
 - [ ] New behavior has a test; changed behavior's existing test was updated,
       not deleted.
 - [ ] `docs/STATUS.md` updated if this changes what's verified/unverified.

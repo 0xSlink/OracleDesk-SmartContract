@@ -27,6 +27,14 @@ transaction.
 
 Existing deployments store `true` under `Agent(addr)`. The registry reads both `AgentRecord` and legacy `bool` seamlessly (treating legacy bool records as `AgentStatus::Active` with `registered_at: 0`); newly registered agents write full `AgentRecord` structs.
 
+### Cross-Contract Market Reference Validation (#55)
+
+Traces published via reasoning registry now validate market references and actions:
+- `TraceAction` enum replaces free-form strings (`CreateMarket`, `ProposeMarket`, `Buy`, `Sell`, `Skip`, `Redeem`, `ClaimRemainder`, `Resolve`, `Other(Symbol)`).
+- Cross-contract read of `market-core`'s `market_count()` verifies `market_id < count`.
+- `ProposeMarket` requires `NO_MARKET` (`u64::MAX`) sentinel for proposals made before market creation.
+- Vendored `contracts/reasoning-registry/market_core.wasm` via `contractimport!` to support cross-contract calls without cyclic cargo dependencies.
+
 ### Merge follow-up: 2026-10-17
 
 The work above landed on `develop` as merge commit `581a3ec` (PR #153,

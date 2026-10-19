@@ -14,7 +14,7 @@ setup:
 	cd x402 && npm install
 
 # Builds all four Soroban contracts to wasm via the Stellar CLI, keeping
-# resolver/treasury's vendored copy of market-core.wasm in sync first (see
+# resolver/treasury/reasoning-registry's vendored copy of market-core.wasm in sync first (see
 # docs/adr/0002-cross-contract-calls.md — contractimport! reads that copy at
 # *their* compile time, so a stale copy silently keeps the old interface).
 build:
@@ -22,6 +22,7 @@ build:
 	stellar contract build
 	cp target/wasm32v1-none/release/market_core.wasm contracts/resolver/market_core.wasm
 	cp target/wasm32v1-none/release/market_core.wasm contracts/treasury/market_core.wasm
+	cp target/wasm32v1-none/release/market_core.wasm contracts/reasoning-registry/market_core.wasm
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/resolver/reasoning_registry.wasm
 	stellar contract build
 

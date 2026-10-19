@@ -10,6 +10,7 @@ export interface TraceRecord {
   traceId: string;
   ipfsCid: string;
   traceHash: string;
+  action?: string;
   verdict?: TraceVerdict;
 }
 

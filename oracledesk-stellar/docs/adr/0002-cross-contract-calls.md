@@ -34,10 +34,10 @@ impl` (not just the types/client we wanted) into `resolver`'s and
 
 ## Decision
 
-`resolver` and `treasury` do not depend on the `market-core` crate at all.
+`resolver`, `treasury`, and `reasoning-registry` do not depend on the `market-core` crate at all.
 Instead, each vendors a copy of the *compiled* `contracts/market-core/target/.../market_core.wasm`
 into its own directory (`contracts/resolver/market_core.wasm`,
-`contracts/treasury/market_core.wasm`) and generates bindings from it:
+`contracts/treasury/market_core.wasm`, `contracts/reasoning-registry/market_core.wasm`) and generates bindings from it:
 
 ```rust
 mod market_core {
@@ -74,10 +74,10 @@ The generated `Outcome` (and other imported enums) do **not** derive `Copy`
 ## Consequences
 
 - **Trade-off accepted**: `market_core.wasm` is a checked-in binary build
-  artifact in two places. Changing `market-core`'s source requires rebuilding
-  it and re-copying the `.wasm` into `contracts/resolver/` and
-  `contracts/treasury/` *before* rebuilding those crates — `contractimport!`
-  reads the file at `resolver`'s/`treasury`'s own compile time, so a stale
+  artifact in three places. Changing `market-core`'s source requires rebuilding
+  it and re-copying the `.wasm` into `contracts/resolver/`, `contracts/treasury/`,
+  and `contracts/reasoning-registry/` *before* rebuilding those crates — `contractimport!`
+  reads the file at `resolver`'s/`treasury`'s/`reasoning-registry`'s own compile time, so a stale
   copy silently keeps the old interface. `make build` runs the steps in the
   right order (market-core first, copy, then the rest); a contributor running
   `cargo build` a la carte on just `resolver` after touching `market-core`

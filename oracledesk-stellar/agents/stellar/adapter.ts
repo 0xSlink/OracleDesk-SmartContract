@@ -14,6 +14,7 @@ import { KeypairSigner } from "@stellar/stellar-sdk/contract";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
+import { toTraceAction, type TraceActionType } from "../core/trace.js";
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 // HERE is agents/stellar/ — the repo root is two levels up.
@@ -254,16 +255,18 @@ export class StellarAdapter {
   async publishTrace(args: {
     agent: string;
     market_id: bigint;
-    action: string;
+    action: TraceActionType | string;
     trace_hash: Buffer;
     ipfs_cid: string;
   }): Promise<AdapterResult<bigint>> {
+    const action = typeof args.action === "string" ? toTraceAction(args.action) : args.action;
+    const call = { ...args, action };
     return this.run(
       "reasoning_registry",
       "@oracledesk/bindings-reasoning-registry",
       "publish_trace",
-      args,
-      (client) => client.publish_trace(args),
+      call,
+      (client) => client.publish_trace(call),
     );
   }
 }

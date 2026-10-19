@@ -5,12 +5,33 @@ use soroban_sdk::{
     Env, String, Symbol, Vec,
 };
 
+mod market_core {
+    #[allow(clippy::too_many_arguments)]
+    soroban_sdk::contractimport!(file = "market_core.wasm");
+}
+
 /// Domain tag for commit-reveal commitments (#51). Must match
 /// `agents/core/trace.ts` byte-for-byte: `sha256(TAG || trace_hash || salt)`.
 pub const COMMIT_DOMAIN_TAG: &[u8] = b"oracledesk.trace.commit.v1";
 
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum TraceAction {
+    CreateMarket,
+    ProposeMarket,
+    Buy,
+    Sell,
+    Skip,
+    Redeem,
+    ClaimRemainder,
+    Resolve,
+    Other(Symbol),
+}
+
+pub const NO_MARKET: u64 = u64::MAX;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -49,7 +70,7 @@ pub enum TraceVerdict {
 pub struct Trace {
     pub market_id: u64,
     pub agent: Address,
-    pub action: String,
+    pub action: TraceAction,
     pub trace_hash: BytesN<32>,
     pub ipfs_cid: String,
     pub published_at: u64,
@@ -85,6 +106,8 @@ pub enum DataKey {
     FlagHistoryCount(u64),
     /// Flag history entries: (trace_id, index) -> TraceFlag (#56).
     FlagHistory(u64, u32),
+    /// Address of market-core contract (#55).
+    MarketCore,
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -113,6 +136,7 @@ pub enum Error {
     AgentAlreadyRegistered = 3,
     AgentNotRegistered = 4,
     TraceNotFound = 5,
+    /// Retained for ABI compatibility; actions are now validated via `TraceAction` (#55).
     EmptyAction = 6,
     EmptyCid = 7,
     /// `expected_seq` / `prev_trace_hash` don't extend the agent's chain head (#52).
@@ -129,6 +153,14 @@ pub enum Error {
     FlagHistoryFull = 13,
     /// Revocation effective_from is invalid (#56).
     InvalidEffectiveTime = 14,
+    /// market_id has not been issued by market-core (#55).
+    UnknownMarket = 15,
+    /// Action requires a valid market_id instead of NO_MARKET (#55).
+    MarketRequired = 16,
+    /// ProposeMarket action must use NO_MARKET sentinel (#55).
+    ProposalMustUseNoMarket = 17,
+    /// Other(Symbol) shadows a canonical TraceAction name (#55).
+    UseCanonicalAction = 18,
 }
 
 #[contractevent]
@@ -221,7 +253,7 @@ pub struct TracePublished {
     pub market_id: u64,
     #[topic]
     pub agent: Address,
-    pub action: String,
+    pub action: TraceAction,
     pub trace_hash: BytesN<32>,
     pub ipfs_cid: String,
     pub published_at: u64,
@@ -232,8 +264,9 @@ pub struct ReasoningRegistry;
 
 #[contractimpl]
 impl ReasoningRegistry {
-    pub fn __constructor(env: Env, admin: Address) {
+    pub fn __constructor(env: Env, admin: Address, market_core: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
     }
 
@@ -316,11 +349,11 @@ impl ReasoningRegistry {
         env: Env,
         agent: Address,
         market_id: u64,
-        action: String,
+        action: TraceAction,
         trace_hash: BytesN<32>,
         ipfs_cid: String,
     ) -> Result<u64, Error> {
-        Self::check_publish(&env, &agent, &action, &ipfs_cid)?;
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
         // Once an agent keeps a chained log, unchained traces would sit outside
         // it unseen, so they're refused (#52).
         if Self::load_head(&env, &agent).seq > 0 {
@@ -338,13 +371,13 @@ impl ReasoningRegistry {
         env: Env,
         agent: Address,
         market_id: u64,
-        action: String,
+        action: TraceAction,
         trace_hash: BytesN<32>,
         ipfs_cid: String,
         expected_seq: u64,
         prev_trace_hash: BytesN<32>,
     ) -> Result<u64, Error> {
-        Self::check_publish(&env, &agent, &action, &ipfs_cid)?;
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
         let head = Self::load_head(&env, &agent);
         if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
             return Err(Error::ChainHeadMismatch);
@@ -651,10 +684,53 @@ impl ReasoningRegistry {
         }
     }
 
+    fn validate_action(env: &Env, action: &TraceAction) -> Result<(), Error> {
+        if let TraceAction::Other(sym) = action {
+            let s = sym.clone();
+            if s == Symbol::new(env, "create_market")
+                || s == Symbol::new(env, "propose_market")
+                || s == Symbol::new(env, "buy")
+                || s == Symbol::new(env, "sell")
+                || s == Symbol::new(env, "skip")
+                || s == Symbol::new(env, "redeem")
+                || s == Symbol::new(env, "claim_remainder")
+                || s == Symbol::new(env, "resolve")
+            {
+                return Err(Error::UseCanonicalAction);
+            }
+        }
+        Ok(())
+    }
+
+    fn validate_reference(env: &Env, market_id: u64, action: &TraceAction) -> Result<(), Error> {
+        let pre_creation = matches!(action, TraceAction::ProposeMarket);
+        if market_id == NO_MARKET {
+            return if pre_creation || matches!(action, TraceAction::Other(_)) {
+                Ok(())
+            } else {
+                Err(Error::MarketRequired)
+            };
+        }
+        if pre_creation {
+            return Err(Error::ProposalMustUseNoMarket);
+        }
+        let mc: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::MarketCore)
+            .ok_or(Error::NotInitialized)?;
+        let count = market_core::Client::new(env, &mc).market_count();
+        if market_id >= count {
+            return Err(Error::UnknownMarket);
+        }
+        Ok(())
+    }
+
     fn check_publish(
         env: &Env,
         agent: &Address,
-        action: &String,
+        market_id: u64,
+        action: &TraceAction,
         ipfs_cid: &String,
     ) -> Result<(), Error> {
         agent.require_auth();
@@ -662,9 +738,8 @@ impl ReasoningRegistry {
         if !matches!(record.status, AgentStatus::Active) {
             return Err(Error::AgentNotActive);
         }
-        if action.is_empty() {
-            return Err(Error::EmptyAction);
-        }
+        Self::validate_action(env, action)?;
+        Self::validate_reference(env, market_id, action)?;
         if ipfs_cid.is_empty() {
             return Err(Error::EmptyCid);
         }
@@ -677,7 +752,7 @@ impl ReasoningRegistry {
         env: &Env,
         agent: Address,
         market_id: u64,
-        action: String,
+        action: TraceAction,
         trace_hash: BytesN<32>,
         ipfs_cid: String,
     ) -> Result<u64, Error> {
@@ -769,14 +844,51 @@ mod test {
         IntoVal,
     };
 
+    fn register_market_core(env: &Env, admin: &Address) -> (Address, market_core::Client<'static>) {
+        let treasury = Address::generate(env);
+        let resolver = Address::generate(env);
+        let creator = Address::generate(env);
+
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = soroban_sdk::token::StellarAssetClient::new(env, &collateral.address());
+        token.mint(&creator, &(50_000 * 10_000_000_i128));
+
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury,
+                resolver,
+                100u32,
+                10_000u32,
+            ),
+        );
+        let market_core = market_core::Client::new(env, &market_core_id);
+        for _ in 0..50 {
+            market_core.create_market(
+                &creator,
+                &BytesN::from_array(env, &[42u8; 32]),
+                &BytesN::from_array(env, &[142u8; 32]),
+                &String::from_str(env, "ipfs://market"),
+                &market_core::Category::Crypto,
+                &(env.ledger().timestamp() + 60_000),
+                &(100 * 10_000_000_i128),
+                &5000u32,
+            );
+        }
+        (market_core_id, market_core)
+    }
+
     fn setup() -> (Env, ReasoningRegistryClient<'static>, Address, Address) {
         let env = Env::default();
         env.mock_all_auths();
         let admin = Address::generate(&env);
         let agent = Address::generate(&env);
+        let (market_core_id, _) = register_market_core(&env, &admin);
         let contract_id = env.register(
             ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin),
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &contract_id);
         (env, client, admin, agent)
@@ -791,7 +903,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &42,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://trace-42"),
         );
@@ -804,7 +916,7 @@ mod test {
         let trace = client.get_trace(&trace_id);
         assert_eq!(trace.market_id, 42);
         assert_eq!(trace.agent, agent);
-        assert_eq!(trace.action, String::from_str(&env, "trade"));
+        assert_eq!(trace.action, TraceAction::Buy);
         assert_eq!(trace.ipfs_cid, String::from_str(&env, "ipfs://trace-42"));
         assert!(client.is_registered(&agent));
 
@@ -823,7 +935,7 @@ mod test {
         client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "pass"),
+            &TraceAction::Skip,
             &BytesN::from_array(&env, &[1u8; 32]),
             &String::from_str(&env, "ipfs://unauthorized"),
         );
@@ -844,14 +956,14 @@ mod test {
         let t0 = client.publish_trace(
             &agent,
             &7,
-            &String::from_str(&env, "create_market"),
+            &TraceAction::CreateMarket,
             &BytesN::from_array(&env, &[1u8; 32]),
             &String::from_str(&env, "ipfs://t0"),
         );
         let t1 = client.publish_trace(
             &agent,
             &7,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[2u8; 32]),
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -859,7 +971,7 @@ mod test {
         client.publish_trace(
             &agent,
             &8,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[3u8; 32]),
             &String::from_str(&env, "ipfs://t2"),
         );
@@ -906,7 +1018,7 @@ mod test {
                     args: (
                         agent.clone(),
                         1u64,
-                        String::from_str(&env, "trade"),
+                        TraceAction::Buy,
                         BytesN::from_array(&env, &[9u8; 32]),
                         String::from_str(&env, "ipfs://impostor"),
                     )
@@ -917,7 +1029,7 @@ mod test {
             .try_publish_trace(
                 &agent,
                 &1,
-                &String::from_str(&env, "trade"),
+                &TraceAction::Buy,
                 &BytesN::from_array(&env, &[9u8; 32]),
                 &String::from_str(&env, "ipfs://impostor"),
             )
@@ -938,7 +1050,7 @@ mod test {
             .try_publish_chained_trace(
                 agent,
                 &1,
-                &String::from_str(env, "buy"),
+                &TraceAction::Buy,
                 &BytesN::from_array(env, &[hash; 32]),
                 &String::from_str(env, "ipfs://chain"),
                 &seq,
@@ -1057,7 +1169,7 @@ mod test {
         let res = client.try_publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "buy"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[4u8; 32]),
             &String::from_str(&env, "ipfs://legacy"),
         );
@@ -1071,7 +1183,7 @@ mod test {
         let id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "buy"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[4u8; 32]),
             &String::from_str(&env, "ipfs://legacy"),
         );
@@ -1114,15 +1226,16 @@ mod test {
         let admin = Address::generate(&env);
         let agent = Address::generate(&env);
         let impostor = Address::generate(&env);
+        let (market_core_id, _) = register_market_core(&env, &admin);
         let id = env.register(
             ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin),
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &id);
         env.mock_all_auths();
         client.register_agent(&agent);
 
-        let action = String::from_str(&env, "buy");
+        let action = TraceAction::Buy;
         let hash = BytesN::from_array(&env, &[1u8; 32]);
         let cid = String::from_str(&env, "ipfs://x");
         let zero = BytesN::from_array(&env, &[0u8; 32]);
@@ -1151,7 +1264,7 @@ mod test {
         let id = client.publish_trace(
             &agent,
             &3,
-            &String::from_str(&env, "buy"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[6u8; 32]),
             &String::from_str(&env, "ipfs://intent"),
         );
@@ -1176,7 +1289,7 @@ mod test {
         let id = client.publish_trace(
             &agent,
             &3,
-            &String::from_str(&env, "buy"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[6u8; 32]),
             &String::from_str(&env, "ipfs://intent"),
         );
@@ -1199,9 +1312,10 @@ mod test {
     fn wrong_caller_cannot_register_consumer() {
         let env = Env::default();
         let admin = Address::generate(&env);
+        let (market_core_id, _) = register_market_core(&env, &admin);
         let id = env.register(
             ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin),
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &id);
         let attacker = Address::generate(&env);
@@ -1251,7 +1365,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1263,7 +1377,7 @@ mod test {
             client.try_publish_trace(
                 &agent,
                 &1,
-                &String::from_str(&env, "trade"),
+                &TraceAction::Buy,
                 &BytesN::from_array(&env, &[2u8; 32]),
                 &String::from_str(&env, "ipfs://t2"),
             ),
@@ -1281,7 +1395,7 @@ mod test {
         let trace_id2 = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &BytesN::from_array(&env, &[3u8; 32]),
             &String::from_str(&env, "ipfs://t3"),
         );
@@ -1300,7 +1414,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1326,7 +1440,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1367,7 +1481,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1406,7 +1520,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1430,7 +1544,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &1,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://t1"),
         );
@@ -1459,9 +1573,10 @@ mod test {
         let env = Env::default();
         let admin = Address::generate(&env);
         let agent = Address::generate(&env);
+        let (market_core_id, _) = register_market_core(&env, &admin);
         let contract_id = env.register(
             ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin),
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &contract_id);
 
@@ -1485,7 +1600,7 @@ mod test {
                 args: (
                     &agent,
                     &42u64,
-                    &String::from_str(&env, "trade"),
+                    &TraceAction::Buy,
                     &trace_hash,
                     &String::from_str(&env, "ipfs://trace-42"),
                 )
@@ -1496,7 +1611,7 @@ mod test {
         let trace_id = client.publish_trace(
             &agent,
             &42,
-            &String::from_str(&env, "trade"),
+            &TraceAction::Buy,
             &trace_hash,
             &String::from_str(&env, "ipfs://trace-42"),
         );
@@ -1531,9 +1646,10 @@ mod test {
         let admin = Address::generate(&env);
         let agent1 = Address::generate(&env);
         let agent2 = Address::generate(&env);
+        let (market_core_id, _) = register_market_core(&env, &admin);
         let contract_id = env.register(
             ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin),
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
         );
         let client = ReasoningRegistryClient::new(&env, &contract_id);
 
@@ -1563,5 +1679,187 @@ mod test {
             },
         }]);
         assert!(client.try_retire_self(&agent2).is_err());
+    }
+
+    // ── #55 Trace market references and action validation ────────────────
+
+    #[test]
+    fn publish_for_existing_market_succeeds() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[11u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &0,
+            &TraceAction::Buy,
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-0"),
+        );
+        let trace = client.get_trace(&trace_id);
+        assert_eq!(trace.market_id, 0);
+        assert_eq!(trace.action, TraceAction::Buy);
+    }
+
+    #[test]
+    fn publish_for_unknown_market_fails_unknown_market() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[12u8; 32]);
+        // 50 markets exist (0..49), so market 50 and 9_999_999 are unknown
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &50,
+                &TraceAction::Buy,
+                &trace_hash,
+                &String::from_str(&env, "ipfs://trace-unknown"),
+            ),
+            Err(Ok(Error::UnknownMarket))
+        );
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &9_999_999,
+                &TraceAction::Buy,
+                &trace_hash,
+                &String::from_str(&env, "ipfs://trace-unknown"),
+            ),
+            Err(Ok(Error::UnknownMarket))
+        );
+    }
+
+    #[test]
+    fn propose_market_requires_no_market_sentinel() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[13u8; 32]);
+        // ProposeMarket with an actual market_id must fail with ProposalMustUseNoMarket
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &1,
+                &TraceAction::ProposeMarket,
+                &trace_hash,
+                &String::from_str(&env, "ipfs://trace-propose"),
+            ),
+            Err(Ok(Error::ProposalMustUseNoMarket))
+        );
+        // ProposeMarket with NO_MARKET must succeed
+        let id = client.publish_trace(
+            &agent,
+            &NO_MARKET,
+            &TraceAction::ProposeMarket,
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-propose"),
+        );
+        let trace = client.get_trace(&id);
+        assert_eq!(trace.market_id, NO_MARKET);
+        assert_eq!(trace.action, TraceAction::ProposeMarket);
+    }
+
+    #[test]
+    fn no_market_sentinel_rejected_for_buy() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[14u8; 32]);
+        assert_eq!(
+            client.try_publish_trace(
+                &agent,
+                &NO_MARKET,
+                &TraceAction::Buy,
+                &trace_hash,
+                &String::from_str(&env, "ipfs://trace-buy-nomarket"),
+            ),
+            Err(Ok(Error::MarketRequired))
+        );
+    }
+
+    #[test]
+    fn other_action_cannot_shadow_canonical_name() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_hash = BytesN::from_array(&env, &[15u8; 32]);
+        // Attempting to use Other with canonical names
+        let canonical_names = [
+            "create_market",
+            "propose_market",
+            "buy",
+            "sell",
+            "skip",
+            "redeem",
+            "claim_remainder",
+            "resolve",
+        ];
+        for name in canonical_names.iter() {
+            assert_eq!(
+                client.try_publish_trace(
+                    &agent,
+                    &0,
+                    &TraceAction::Other(Symbol::new(&env, name)),
+                    &trace_hash,
+                    &String::from_str(&env, "ipfs://trace-shadow"),
+                ),
+                Err(Ok(Error::UseCanonicalAction))
+            );
+        }
+        // Non-canonical name succeeds (works with NO_MARKET or valid market_id)
+        let id1 = client.publish_trace(
+            &agent,
+            &NO_MARKET,
+            &TraceAction::Other(Symbol::new(&env, "custom_strategy")),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-custom"),
+        );
+        let trace1 = client.get_trace(&id1);
+        assert_eq!(trace1.action, TraceAction::Other(Symbol::new(&env, "custom_strategy")));
+
+        let id2 = client.publish_trace(
+            &agent,
+            &0,
+            &TraceAction::Other(Symbol::new(&env, "custom_strategy_2")),
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-custom-2"),
+        );
+        let trace2 = client.get_trace(&id2);
+        assert_eq!(trace2.action, TraceAction::Other(Symbol::new(&env, "custom_strategy_2")));
+    }
+
+    #[test]
+    fn publish_works_while_market_core_paused() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let agent = Address::generate(&env);
+        let (market_core_id, market_core_client) = register_market_core(&env, &admin);
+        let contract_id = env.register(
+            ReasoningRegistry,
+            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
+        );
+        let client = ReasoningRegistryClient::new(&env, &contract_id);
+        client.register_agent(&agent);
+
+        // Pause market-core
+        market_core_client.set_paused(&true);
+
+        // Registry publish_trace must still succeed because market_count is a view call
+        let trace_hash = BytesN::from_array(&env, &[16u8; 32]);
+        let trace_id = client.publish_trace(
+            &agent,
+            &0,
+            &TraceAction::Buy,
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-while-paused"),
+        );
+        assert_eq!(trace_id, 0);
+    }
+
+    #[test]
+    fn market_ids_are_dense_assumption_holds() {
+        let env = Env::default();
+        env.mock_all_auths();
+        let admin = Address::generate(&env);
+        let (_market_core_id, market_core_client) = register_market_core(&env, &admin);
+        let count = market_core_client.market_count();
+        assert_eq!(count, 50);
     }
 }

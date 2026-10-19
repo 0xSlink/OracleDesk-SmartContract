@@ -90,11 +90,12 @@ for f in market_core resolver reasoning_registry treasury; do
   fi
 done
 
-# contractimport! (resolver, treasury) reads a vendored copy of
+# contractimport! (resolver, treasury, reasoning-registry) reads a vendored copy of
 # market-core's wasm at *their* compile time — keep it fresh before
 # rebuilding them. See docs/adr/0002-cross-contract-calls.md.
 cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
 cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
+cp "$WASM_DIR/market_core.wasm" contracts/reasoning-registry/market_core.wasm
 cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
 stellar contract build
 
@@ -197,7 +198,8 @@ if [ -z "$REGISTRY" ]; then
     --source-account "$DEPLOYER_KEY" \
     --network "$NETWORK" \
     -- \
-    --admin "$DEPLOYER")
+    --admin "$DEPLOYER" \
+    --market_core "$MARKET_CORE")
   json_set --arg id "$REGISTRY" '.contracts.reasoning_registry = $id'
 else
   log "reasoning-registry already deployed: $REGISTRY"

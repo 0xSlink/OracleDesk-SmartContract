@@ -47,8 +47,23 @@ export const Errors = {
   11: {message:"AgentNotActive"},
   12: {message:"CannotReactivateRevoked"},
   13: {message:"FlagHistoryFull"},
-  14: {message:"InvalidEffectiveTime"}
+  14: {message:"InvalidEffectiveTime"},
+  15: {message:"UnknownMarket"},
+  16: {message:"MarketRequired"},
+  17: {message:"ProposalMustUseNoMarket"},
+  18: {message:"UseCanonicalAction"}
 }
+
+export type TraceAction =
+  | { tag: "CreateMarket", values: void }
+  | { tag: "ProposeMarket", values: void }
+  | { tag: "Buy", values: void }
+  | { tag: "Sell", values: void }
+  | { tag: "Skip", values: void }
+  | { tag: "Redeem", values: void }
+  | { tag: "ClaimRemainder", values: void }
+  | { tag: "Resolve", values: void }
+  | { tag: "Other", values: readonly [string] };
 
 export type AgentStatus =
   | { tag: "Active", values: void }
@@ -73,7 +88,7 @@ export type TraceVerdict =
   | { tag: "AgentRevokedAfter", values: readonly [u64] };
 
 export interface Trace {
-  action: string;
+  action: TraceAction;
   agent: string;
   ipfs_cid: string;
   market_id: u64;
@@ -90,7 +105,8 @@ export type DataKey =
   | {tag: "MarketTrace", values: readonly [u64, u64]}
   | {tag: "Flag", values: readonly [u64]}
   | {tag: "FlagHistoryCount", values: readonly [u64]}
-  | {tag: "FlagHistory", values: readonly [u64, u32]};
+  | {tag: "FlagHistory", values: readonly [u64, u32]}
+  | {tag: "MarketCore", values: void};
 
 export interface Client {
   get_trace: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Trace>>>
@@ -99,7 +115,7 @@ export interface Client {
   trace_verdict: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TraceVerdict>>>
   is_registered: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
   get_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Option<AgentRecord>>>
-  publish_trace: ({agent, market_id, action, trace_hash, ipfs_cid}: {agent: string, market_id: u64, action: string, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  publish_trace: ({agent, market_id, action, trace_hash, ipfs_cid}: {agent: string, market_id: u64, action: TraceAction, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
   register_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
   retire_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
   retire_self: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
@@ -116,7 +132,7 @@ export interface Client {
 export class Client extends ContractClient {
   static async deploy<T = Client>(
         /** Constructor/Initialization Args for the contract's `__constructor` method */
-        {admin}: {admin: string},
+        {admin, market_core}: {admin: string, market_core: string},
     /** Options for initializing a Client as well as for calling a method, with extras specific to deploying. */
     options: MethodOptions &
       Omit<ContractClientOptions, "contractId"> & {
@@ -128,7 +144,7 @@ export class Client extends ContractClient {
         format?: "hex" | "base64";
       }
   ): Promise<AssembledTransaction<T>> {
-    return ContractClient.deploy({admin}, options)
+    return ContractClient.deploy({admin, market_core}, options)
   }
   constructor(public readonly options: ContractClientOptions) {
     super(

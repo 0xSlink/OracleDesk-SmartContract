@@ -16,10 +16,48 @@ import type { TraceVerdict } from "./trace-verification.js";
 
 export type { TraceVerdict };
 
+export type RegistryAction =
+  | string
+  | { tag: "CreateMarket"; values?: void }
+  | { tag: "ProposeMarket"; values?: void }
+  | { tag: "Buy"; values?: void }
+  | { tag: "Sell"; values?: void }
+  | { tag: "Skip"; values?: void }
+  | { tag: "Redeem"; values?: void }
+  | { tag: "ClaimRemainder"; values?: void }
+  | { tag: "Resolve"; values?: void }
+  | { tag: "Other"; values: [string] | readonly [string] };
+
+export function normalizeAction(action: RegistryAction): string {
+  if (typeof action === "string") return action;
+  switch (action.tag) {
+    case "CreateMarket":
+      return "create_market";
+    case "ProposeMarket":
+      return "propose_market";
+    case "Buy":
+      return "buy";
+    case "Sell":
+      return "sell";
+    case "Skip":
+      return "skip";
+    case "Redeem":
+      return "redeem";
+    case "ClaimRemainder":
+      return "claim_remainder";
+    case "Resolve":
+      return "resolve";
+    case "Other":
+      return action.values?.[0] ?? "other";
+    default:
+      return String((action as any).tag ?? "unknown").toLowerCase();
+  }
+}
+
 export interface RegistryTrace {
   market_id: bigint;
   agent: string;
-  action: string;
+  action: RegistryAction;
   trace_hash: Buffer;
   ipfs_cid: string;
   published_at: bigint;
@@ -58,6 +96,7 @@ export class RegistryTraceRepository implements TraceRepository {
         traceId,
         ipfsCid: result.ipfs_cid,
         traceHash: result.trace_hash.toString("hex"),
+        action: normalizeAction(result.action),
         verdict,
       };
     } catch {

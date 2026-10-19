@@ -101,7 +101,7 @@ export async function main(
     const traceResult = await adapter.publishTrace({
       agent: adapter.agent,
       market_id: BigInt(market.marketId),
-      action: "buy",
+      action: { tag: "Buy", values: undefined },
       trace_hash: Buffer.from(built.hash, "hex"),
       ipfs_cid: cid,
     });
