@@ -20,6 +20,19 @@ pub const MAX_PROOF_LEN: u32 = 12;
 pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
 pub const MERKLE_NODE_PREFIX: u8 = 0x01;
 
+/// Signing key constants for Ed25519 attestations (#53).
+pub const MAX_AGENT_SIGNING_KEYS: u32 = 4;
+pub const AGENT_KEY_BIND_DOMAIN: &[u8] = b"oracledesk-agent-key-v1";
+pub const TRACE_SIG_DOMAIN: &[u8] = b"oracledesk-trace-v1";
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SigningKeyRecord {
+    pub public_key: BytesN<32>,
+    pub added_at: u64,
+    pub retired_at: Option<u64>,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct TraceBatch {
@@ -132,6 +145,16 @@ pub enum DataKey {
     AgentBatchCount(Address),
     /// Agent batch index: (agent, index) -> batch_id (#54).
     AgentBatch(Address, u64),
+    /// Active signing keys for an agent: Address -> Vec<BytesN<32>> (#53).
+    AgentSigningKeys(Address),
+    /// Number of signing key history records for an agent (#53).
+    SigningKeyHistoryCount(Address),
+    /// Paged signing key history: (agent, index) -> SigningKeyRecord (#53).
+    SigningKeyHistory(Address, u32),
+    /// Lookup from signing key to agent: BytesN<32> -> Address (#53).
+    KeyToAgent(BytesN<32>),
+    /// Ed25519 trace signature: trace_id -> (BytesN<32>, BytesN<64>) (#53).
+    TraceSignature(u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -191,6 +214,45 @@ pub enum Error {
     InvalidBatch = 20,
     /// Inclusion proof is invalid or malformed (#54).
     InvalidProof = 21,
+    /// Agent signing key list is full (max 4 active keys) (#53).
+    TooManyKeys = 22,
+    /// Key is already bound to an agent (#53).
+    KeyAlreadyBound = 23,
+    /// Signing key is invalid, unknown, or not authorized (#53).
+    InvalidKey = 24,
+    /// Ed25519 signature verification failed (#53).
+    InvalidSignature = 25,
+    /// Requested trace does not have an attestation signature (#53).
+    TraceNotSigned = 26,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyAdded {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSigningKeyRetired {
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub public_key: BytesN<32>,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceSigned {
+    #[topic]
+    pub trace_id: u64,
+    #[topic]
+    pub agent: Address,
+    #[topic]
+    pub signing_key: BytesN<32>,
 }
 
 #[contractevent]
@@ -847,9 +909,423 @@ impl ReasoningRegistry {
 
         Ok(current)
     }
+
+    pub fn add_signing_key(
+        env: Env,
+        agent: Address,
+        public_key: BytesN<32>,
+        proof_sig: BytesN<64>,
+    ) -> Result<(), Error> {
+        agent.require_auth();
+        Self::require_active_agent(&env, &agent)?;
+
+        if public_key == BytesN::from_array(&env, &[0u8; 32]) {
+            return Err(Error::InvalidKey);
+        }
+
+        let bind_msg = Self::key_bind_message(&env, &agent, &public_key);
+        env.crypto().ed25519_verify(&public_key, &bind_msg, &proof_sig);
+
+        let key_to_agent = DataKey::KeyToAgent(public_key.clone());
+        if env.storage().persistent().has(&key_to_agent) {
+            return Err(Error::KeyAlreadyBound);
+        }
+
+        let agent_keys_key = DataKey::AgentSigningKeys(agent.clone());
+        let mut keys: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&agent_keys_key)
+            .unwrap_or_else(|| Vec::new(&env));
+        if keys.len() >= MAX_AGENT_SIGNING_KEYS {
+            return Err(Error::TooManyKeys);
+        }
+
+        keys.push_back(public_key.clone());
+        Self::put(&env, &agent_keys_key, &keys);
+        Self::put(&env, &key_to_agent, &agent);
+
+        let history_count_key = DataKey::SigningKeyHistoryCount(agent.clone());
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&history_count_key)
+            .unwrap_or(0);
+        let record = SigningKeyRecord {
+            public_key: public_key.clone(),
+            added_at: env.ledger().timestamp(),
+            retired_at: None,
+        };
+        Self::put(&env, &DataKey::SigningKeyHistory(agent.clone(), count), &record);
+        Self::put(&env, &history_count_key, &(count + 1));
+
+        AgentSigningKeyAdded {
+            agent,
+            public_key,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn retire_signing_key(
+        env: Env,
+        agent: Address,
+        public_key: BytesN<32>,
+    ) -> Result<(), Error> {
+        agent.require_auth();
+        Self::require_active_agent(&env, &agent)?;
+
+        let agent_keys_key = DataKey::AgentSigningKeys(agent.clone());
+        let mut keys: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&agent_keys_key)
+            .unwrap_or_else(|| Vec::new(&env));
+
+        let mut found_index: Option<u32> = None;
+        for i in 0..keys.len() {
+            if keys.get(i).unwrap() == public_key {
+                found_index = Some(i);
+                break;
+            }
+        }
+
+        let Some(idx) = found_index else {
+            return Err(Error::InvalidKey);
+        };
+
+        keys.remove(idx);
+        Self::put(&env, &agent_keys_key, &keys);
+
+        let history_count_key = DataKey::SigningKeyHistoryCount(agent.clone());
+        let count: u32 = env
+            .storage()
+            .persistent()
+            .get(&history_count_key)
+            .unwrap_or(0);
+        for i in 0..count {
+            let hist_key = DataKey::SigningKeyHistory(agent.clone(), i);
+            if let Some(mut record) = env.storage().persistent().get::<_, SigningKeyRecord>(&hist_key) {
+                if record.public_key == public_key && record.retired_at.is_none() {
+                    record.retired_at = Some(env.ledger().timestamp());
+                    Self::put(&env, &hist_key, &record);
+                    break;
+                }
+            }
+        }
+
+        AgentSigningKeyRetired {
+            agent,
+            public_key,
+        }
+        .publish(&env);
+
+        Ok(())
+    }
+
+    pub fn get_signing_keys(env: Env, agent: Address) -> Vec<BytesN<32>> {
+        let key = DataKey::AgentSigningKeys(agent);
+        match env.storage().persistent().get::<_, Vec<BytesN<32>>>(&key) {
+            Some(keys) => {
+                Self::bump_persistent(&env, &key);
+                keys
+            }
+            None => Vec::new(&env),
+        }
+    }
+
+    pub fn get_key_agent(env: Env, public_key: BytesN<32>) -> Option<Address> {
+        let key = DataKey::KeyToAgent(public_key);
+        match env.storage().persistent().get::<_, Address>(&key) {
+            Some(agent) => {
+                Self::bump_persistent(&env, &key);
+                Some(agent)
+            }
+            None => None,
+        }
+    }
+
+    pub fn signing_key_history_count(env: Env, agent: Address) -> u32 {
+        let key = DataKey::SigningKeyHistoryCount(agent);
+        match env.storage().persistent().get::<_, u32>(&key) {
+            Some(count) => {
+                Self::bump_persistent(&env, &key);
+                count
+            }
+            None => 0,
+        }
+    }
+
+    pub fn signing_key_history(
+        env: Env,
+        agent: Address,
+        start: u32,
+        limit: u32,
+    ) -> Result<Vec<SigningKeyRecord>, Error> {
+        let total = Self::signing_key_history_count(env.clone(), agent.clone());
+        let mut out = Vec::new(&env);
+        if start >= total || limit == 0 {
+            return Ok(out);
+        }
+        let end = core::cmp::min(start + limit, total);
+        for i in start..end {
+            let key = DataKey::SigningKeyHistory(agent.clone(), i);
+            if let Some(record) = env.storage().persistent().get::<_, SigningKeyRecord>(&key) {
+                Self::bump_persistent(&env, &key);
+                out.push_back(record);
+            }
+        }
+        Ok(out)
+    }
+
+    pub fn publish_trace_signed(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        trace_hash: BytesN<32>,
+        ipfs_cid: String,
+        signing_key: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        if Self::load_head(&env, &agent).seq > 0 {
+            return Err(Error::ChainedAgentMustChain);
+        }
+
+        let keys: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentSigningKeys(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_active = false;
+        for k in keys.iter() {
+            if k == signing_key {
+                is_active = true;
+                break;
+            }
+        }
+        if !is_active {
+            return Err(Error::InvalidKey);
+        }
+
+        let msg = Self::trace_attestation_message(
+            &env,
+            &agent,
+            market_id,
+            &action,
+            &trace_hash,
+        );
+        env.crypto().ed25519_verify(&signing_key, &msg, &signature);
+
+        let id = Self::write_trace(
+            &env,
+            agent.clone(),
+            market_id,
+            action,
+            trace_hash,
+            ipfs_cid,
+        )?;
+
+        let sig_key = DataKey::TraceSignature(id);
+        Self::put(&env, &sig_key, &(signing_key.clone(), signature));
+
+        TraceSigned {
+            trace_id: id,
+            agent,
+            signing_key,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_chained_trace_signed(
+        env: Env,
+        agent: Address,
+        market_id: u64,
+        action: TraceAction,
+        trace_hash: BytesN<32>,
+        ipfs_cid: String,
+        expected_seq: u64,
+        prev_trace_hash: BytesN<32>,
+        signing_key: BytesN<32>,
+        signature: BytesN<64>,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        Self::check_publish(&env, &agent, market_id, &action, &ipfs_cid)?;
+        let head = Self::load_head(&env, &agent);
+        if expected_seq != head.seq + 1 || prev_trace_hash != head.head_hash {
+            return Err(Error::ChainHeadMismatch);
+        }
+
+        let keys: Vec<BytesN<32>> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::AgentSigningKeys(agent.clone()))
+            .unwrap_or_else(|| Vec::new(&env));
+        let mut is_active = false;
+        for k in keys.iter() {
+            if k == signing_key {
+                is_active = true;
+                break;
+            }
+        }
+        if !is_active {
+            return Err(Error::InvalidKey);
+        }
+
+        let msg = Self::trace_attestation_message(
+            &env,
+            &agent,
+            market_id,
+            &action,
+            &trace_hash,
+        );
+        env.crypto().ed25519_verify(&signing_key, &msg, &signature);
+
+        let id = Self::write_trace(
+            &env,
+            agent.clone(),
+            market_id,
+            action,
+            trace_hash.clone(),
+            ipfs_cid,
+        )?;
+
+        let link_key = DataKey::TraceLink(id);
+        Self::put(
+            &env,
+            &link_key,
+            &ChainLink {
+                seq: expected_seq,
+                prev_trace_hash: prev_trace_hash.clone(),
+            },
+        );
+        Self::put(&env, &DataKey::AgentTrace(agent.clone(), expected_seq), &id);
+        Self::put(
+            &env,
+            &DataKey::AgentHead(agent.clone()),
+            &ChainHead {
+                seq: expected_seq,
+                head_hash: trace_hash.clone(),
+                head_trace_id: Some(id),
+            },
+        );
+
+        let sig_key = DataKey::TraceSignature(id);
+        Self::put(&env, &sig_key, &(signing_key.clone(), signature));
+
+        TraceChained {
+            agent: agent.clone(),
+            seq: expected_seq,
+            trace_id: id,
+            prev_trace_hash,
+            trace_hash,
+        }
+        .publish(&env);
+
+        TraceSigned {
+            trace_id: id,
+            agent,
+            signing_key,
+        }
+        .publish(&env);
+
+        Ok(id)
+    }
+
+    pub fn get_trace_signature(env: Env, trace_id: u64) -> Option<(BytesN<32>, BytesN<64>)> {
+        let key = DataKey::TraceSignature(trace_id);
+        match env
+            .storage()
+            .persistent()
+            .get::<_, (BytesN<32>, BytesN<64>)>(&key)
+        {
+            Some(sig) => {
+                Self::bump_persistent(&env, &key);
+                Some(sig)
+            }
+            None => None,
+        }
+    }
+
+    pub fn verify_trace_signature(env: Env, trace_id: u64) -> Result<bool, Error> {
+        let trace = Self::load_trace(&env, trace_id)?;
+        let key = DataKey::TraceSignature(trace_id);
+        let Some((signing_key, signature)) = env
+            .storage()
+            .persistent()
+            .get::<_, (BytesN<32>, BytesN<64>)>(&key)
+        else {
+            return Err(Error::TraceNotSigned);
+        };
+        Self::bump_persistent(&env, &key);
+
+        let bound_agent = Self::get_key_agent(env.clone(), signing_key.clone());
+        if bound_agent.as_ref() != Some(&trace.agent) {
+            return Ok(false);
+        }
+
+        let msg = Self::trace_attestation_message(
+            &env,
+            &trace.agent,
+            trace.market_id,
+            &trace.action,
+            &trace.trace_hash,
+        );
+        env.crypto().ed25519_verify(&signing_key, &msg, &signature);
+        Ok(true)
+    }
 }
 
 impl ReasoningRegistry {
+    pub fn key_bind_message(
+        env: &Env,
+        agent: &Address,
+        public_key: &BytesN<32>,
+    ) -> Bytes {
+        let mut message = Bytes::from_slice(env, AGENT_KEY_BIND_DOMAIN);
+        message.append(&env.ledger().network_id().into());
+        message.append(&env.current_contract_address().to_xdr(env));
+        message.append(&agent.to_xdr(env));
+        message.append(&public_key.clone().into());
+        message
+    }
+
+    pub fn trace_attestation_message(
+        env: &Env,
+        agent: &Address,
+        market_id: u64,
+        action: &TraceAction,
+        trace_hash: &BytesN<32>,
+    ) -> Bytes {
+        let mut message = Bytes::from_slice(env, TRACE_SIG_DOMAIN);
+        message.append(&env.ledger().network_id().into());
+        message.append(&env.current_contract_address().to_xdr(env));
+        message.append(&agent.to_xdr(env));
+        message.extend_from_array(&market_id.to_be_bytes());
+        message.push_back(match action {
+            TraceAction::CreateMarket => 0,
+            TraceAction::ProposeMarket => 1,
+            TraceAction::Buy => 2,
+            TraceAction::Sell => 3,
+            TraceAction::Skip => 4,
+            TraceAction::Redeem => 5,
+            TraceAction::ClaimRemainder => 6,
+            TraceAction::Resolve => 7,
+            TraceAction::Other(_) => 8,
+        });
+        if let TraceAction::Other(sym) = action {
+            message.append(&sym.to_xdr(env));
+        }
+        message.append(&trace_hash.clone().into());
+        message
+    }
+
     fn retire_agent_internal(env: &Env, agent: Address) -> Result<(), Error> {
         let mut record = Self::load_agent(env, &agent).ok_or(Error::AgentNotRegistered)?;
         if matches!(record.status, AgentStatus::Revoked(_, _)) {
@@ -2314,6 +2790,200 @@ mod test {
                 &String::from_str(&env, "ipfs://manifest"),
             ),
             Err(Ok(Error::AgentNotActive))
+        );
+    }
+
+    fn bytes_to_vec(bytes: &Bytes) -> std::vec::Vec<u8> {
+        let mut out = std::vec![0u8; bytes.len() as usize];
+        bytes.copy_into_slice(&mut out);
+        out
+    }
+
+    #[test]
+    fn add_signing_key_and_publish_signed_trace() {
+        use ed25519_dalek::Signer;
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let signing_key = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let pubkey_bytes: [u8; 32] = signing_key.verifying_key().to_bytes();
+        let pubkey = BytesN::from_array(&env, &pubkey_bytes);
+
+        // Build key bind message
+        let bind_msg = env.as_contract(&client.address, || {
+            ReasoningRegistry::key_bind_message(&env, &agent, &pubkey)
+        });
+        let msg_bytes = bytes_to_vec(&bind_msg);
+        let proof_sig_bytes = signing_key.sign(&msg_bytes).to_bytes();
+        let proof_sig = BytesN::from_array(&env, &proof_sig_bytes);
+
+        // Add signing key
+        client.add_signing_key(&agent, &pubkey, &proof_sig);
+
+        // Check queries
+        let active_keys = client.get_signing_keys(&agent);
+        assert_eq!(active_keys.len(), 1);
+        assert_eq!(active_keys.get(0).unwrap(), pubkey);
+        assert_eq!(client.get_key_agent(&pubkey), Some(agent.clone()));
+        assert_eq!(client.signing_key_history_count(&agent), 1);
+
+        // Publish signed trace
+        let trace_hash = BytesN::from_array(&env, &[9u8; 32]);
+        let attestation_msg = env.as_contract(&client.address, || {
+            ReasoningRegistry::trace_attestation_message(
+                &env,
+                &agent,
+                NO_MARKET,
+                &TraceAction::ProposeMarket,
+                &trace_hash,
+            )
+        });
+        let att_bytes = bytes_to_vec(&attestation_msg);
+        let trace_sig_bytes = signing_key.sign(&att_bytes).to_bytes();
+        let trace_sig = BytesN::from_array(&env, &trace_sig_bytes);
+
+        let trace_id = client.publish_trace_signed(
+            &agent,
+            &NO_MARKET,
+            &TraceAction::ProposeMarket,
+            &trace_hash,
+            &String::from_str(&env, "ipfs://trace-1"),
+            &pubkey,
+            &trace_sig,
+        );
+
+        assert_eq!(trace_id, 0);
+        let stored_sig = client.get_trace_signature(&trace_id);
+        assert_eq!(stored_sig, Some((pubkey.clone(), trace_sig)));
+        assert!(client.verify_trace_signature(&trace_id));
+
+        // Retire signing key
+        client.retire_signing_key(&agent, &pubkey);
+        assert_eq!(client.get_signing_keys(&agent).len(), 0);
+        assert_eq!(client.signing_key_history_count(&agent), 1);
+        let history = client.signing_key_history(&agent, &0, &10);
+        assert_eq!(history.len(), 1);
+        assert!(history.get(0).unwrap().retired_at.is_some());
+    }
+
+    #[test]
+    fn signing_key_max_limit_and_uniqueness() {
+        use ed25519_dalek::Signer;
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        for i in 1..=4 {
+            let sk = ed25519_dalek::SigningKey::from_bytes(&[i as u8; 32]);
+            let pk = BytesN::from_array(&env, &sk.verifying_key().to_bytes());
+            let bind_msg = env.as_contract(&client.address, || {
+                ReasoningRegistry::key_bind_message(&env, &agent, &pk)
+            });
+            let sig = BytesN::from_array(&env, &sk.sign(&bytes_to_vec(&bind_msg)).to_bytes());
+            client.add_signing_key(&agent, &pk, &sig);
+        }
+
+        assert_eq!(client.get_signing_keys(&agent).len(), 4);
+
+        // 5th key exceeds MAX_AGENT_SIGNING_KEYS
+        let sk5 = ed25519_dalek::SigningKey::from_bytes(&[5u8; 32]);
+        let pk5 = BytesN::from_array(&env, &sk5.verifying_key().to_bytes());
+        let bind_msg5 = env.as_contract(&client.address, || {
+            ReasoningRegistry::key_bind_message(&env, &agent, &pk5)
+        });
+        let sig5 = BytesN::from_array(&env, &sk5.sign(&bytes_to_vec(&bind_msg5)).to_bytes());
+        assert_eq!(
+            client.try_add_signing_key(&agent, &pk5, &sig5),
+            Err(Ok(Error::TooManyKeys))
+        );
+
+        // Duplicate key binding fails
+        let sk1 = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let pk1 = BytesN::from_array(&env, &sk1.verifying_key().to_bytes());
+        let bind_msg1 = env.as_contract(&client.address, || {
+            ReasoningRegistry::key_bind_message(&env, &agent, &pk1)
+        });
+        let sig1 = BytesN::from_array(&env, &sk1.sign(&bytes_to_vec(&bind_msg1)).to_bytes());
+        assert_eq!(
+            client.try_add_signing_key(&agent, &pk1, &sig1),
+            Err(Ok(Error::KeyAlreadyBound))
+        );
+    }
+
+    #[test]
+    fn retiring_unowned_key_fails() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let fake_key = BytesN::from_array(&env, &[99u8; 32]);
+        assert_eq!(
+            client.try_retire_signing_key(&agent, &fake_key),
+            Err(Ok(Error::InvalidKey))
+        );
+    }
+
+    #[test]
+    fn publish_signed_trace_with_unregistered_key_fails() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let unreg_key = BytesN::from_array(&env, &[99u8; 32]);
+        let fake_sig = BytesN::from_array(&env, &[0u8; 64]);
+        assert_eq!(
+            client.try_publish_trace_signed(
+                &agent,
+                &NO_MARKET,
+                &TraceAction::ProposeMarket,
+                &BytesN::from_array(&env, &[1u8; 32]),
+                &String::from_str(&env, "ipfs://cid"),
+                &unreg_key,
+                &fake_sig,
+            ),
+            Err(Ok(Error::InvalidKey))
+        );
+    }
+
+    #[test]
+    fn unregistered_or_retired_agent_cannot_add_signing_key() {
+        use ed25519_dalek::Signer;
+        let (env, client, _, agent) = setup();
+        let sk = ed25519_dalek::SigningKey::from_bytes(&[1u8; 32]);
+        let pk = BytesN::from_array(&env, &sk.verifying_key().to_bytes());
+        let bind_msg = env.as_contract(&client.address, || {
+            ReasoningRegistry::key_bind_message(&env, &agent, &pk)
+        });
+        let sig = BytesN::from_array(&env, &sk.sign(&bytes_to_vec(&bind_msg)).to_bytes());
+
+        // Unregistered
+        assert_eq!(
+            client.try_add_signing_key(&agent, &pk, &sig),
+            Err(Ok(Error::AgentNotRegistered))
+        );
+
+        // Register and retire
+        client.register_agent(&agent);
+        client.retire_agent(&agent);
+
+        // Retired
+        assert_eq!(
+            client.try_add_signing_key(&agent, &pk, &sig),
+            Err(Ok(Error::AgentNotActive))
+        );
+    }
+
+    #[test]
+    fn unsigned_trace_signature_queries() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let trace_id = client.publish_trace(
+            &agent,
+            &NO_MARKET,
+            &TraceAction::ProposeMarket,
+            &BytesN::from_array(&env, &[1u8; 32]),
+            &String::from_str(&env, "ipfs://cid"),
+        );
+
+        assert_eq!(client.get_trace_signature(&trace_id), None);
+        assert_eq!(
+            client.try_verify_trace_signature(&trace_id),
+            Err(Ok(Error::TraceNotSigned))
         );
     }
 }

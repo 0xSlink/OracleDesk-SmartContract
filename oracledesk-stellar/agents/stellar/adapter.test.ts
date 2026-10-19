@@ -203,3 +203,57 @@ test("dry-run publishTraceBatch describes batch anchoring without network", asyn
     assert.equal((result.args as any).manifest_cid, "ipfs://batch-manifest-50");
   }
 });
+
+test("dry-run addSigningKey and publishTraceSigned describe calls without network", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+
+  const pubkey = Buffer.alloc(32, 3);
+  const proofSig = Buffer.alloc(64, 4);
+  const addRes = await adapter.addSigningKey({
+    agent: "GAGENT",
+    public_key: pubkey,
+    proof_sig: proofSig,
+  });
+  assert.equal(addRes.dryRun, true);
+  if (addRes.dryRun) {
+    assert.equal(addRes.contractId, "CREGISTRY");
+    assert.equal(addRes.method, "add_signing_key");
+    assert.deepEqual((addRes.args as any).public_key, pubkey);
+  }
+
+  const traceSig = Buffer.alloc(64, 5);
+  const traceHash = Buffer.alloc(32, 6);
+  const pubRes = await adapter.publishTraceSigned({
+    agent: "GAGENT",
+    market_id: 10n,
+    action: "buy",
+    trace_hash: traceHash,
+    ipfs_cid: "ipfs://signed-trace-10",
+    signing_key: pubkey,
+    signature: traceSig,
+  });
+  assert.equal(pubRes.dryRun, true);
+  if (pubRes.dryRun) {
+    assert.equal(pubRes.contractId, "CREGISTRY");
+    assert.equal(pubRes.method, "publish_trace_signed");
+    assert.deepEqual((pubRes.args as any).signing_key, pubkey);
+    assert.deepEqual((pubRes.args as any).signature, traceSig);
+    assert.deepEqual((pubRes.args as any).action, { tag: "Buy", values: undefined });
+  }
+
+  const retRes = await adapter.retireSigningKey({
+    agent: "GAGENT",
+    public_key: pubkey,
+  });
+  assert.equal(retRes.dryRun, true);
+  if (retRes.dryRun) {
+    assert.equal(retRes.contractId, "CREGISTRY");
+    assert.equal(retRes.method, "retire_signing_key");
+  }
+});
+

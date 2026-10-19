@@ -1,10 +1,11 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { createHash } from "node:crypto";
+import { createHash, generateKeyPairSync, sign } from "node:crypto";
 import {
   ipfsUrl,
   verifyBatchInclusion,
   verifyChain,
+  verifyEd25519Signature,
   verifyTraceHash,
   type ChainEntry,
 } from "./trace-verification.js";
@@ -81,3 +82,22 @@ test("verifyBatchInclusion verifies against golden vector", () => {
   assert.equal(verifyBatchInclusion(root, 2, "00".repeat(32), 0, [sibling1]), false);
   assert.equal(verifyBatchInclusion(root, 2, trace0, 0, ["00".repeat(32)]), false);
 });
+
+// ─── Ed25519 trace attestations (#53) ───────────────────────────────────────
+
+test("verifyEd25519Signature verifies valid signatures and rejects bad ones", () => {
+  const { publicKey, privateKey } = generateKeyPairSync("ed25519");
+  const rawPubkey = publicKey.export({ format: "der", type: "spki" }).subarray(12);
+  const message = Buffer.from("test trace message");
+  const signature = sign(null, message, privateKey);
+
+  assert.equal(verifyEd25519Signature(rawPubkey, message, signature), true);
+
+  const tamperedMessage = Buffer.from("tampered trace message");
+  assert.equal(verifyEd25519Signature(rawPubkey, tamperedMessage, signature), false);
+
+  const tamperedSig = Buffer.from(signature);
+  tamperedSig[0] ^= 0xff;
+  assert.equal(verifyEd25519Signature(rawPubkey, message, tamperedSig), false);
+});
+

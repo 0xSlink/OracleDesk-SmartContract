@@ -54,7 +54,18 @@ export const Errors = {
   18: {message:"UseCanonicalAction"},
   19: {message:"BatchNotFound"},
   20: {message:"InvalidBatch"},
-  21: {message:"InvalidProof"}
+  21: {message:"InvalidProof"},
+  22: {message:"TooManyKeys"},
+  23: {message:"KeyAlreadyBound"},
+  24: {message:"InvalidKey"},
+  25: {message:"InvalidSignature"},
+  26: {message:"TraceNotSigned"}
+}
+
+export interface SigningKeyRecord {
+  added_at: u64;
+  public_key: Buffer;
+  retired_at: Option<u64>;
 }
 
 export interface TraceBatch {
@@ -121,9 +132,24 @@ export type DataKey =
   | {tag: "Batch", values: readonly [u64]}
   | {tag: "NextBatchId", values: void}
   | {tag: "AgentBatchCount", values: readonly [string]}
-  | {tag: "AgentBatch", values: readonly [string, u64]};
+  | {tag: "AgentBatch", values: readonly [string, u64]}
+  | {tag: "AgentSigningKeys", values: readonly [string]}
+  | {tag: "SigningKeyHistoryCount", values: readonly [string]}
+  | {tag: "SigningKeyHistory", values: readonly [string, u32]}
+  | {tag: "KeyToAgent", values: readonly [Buffer]}
+  | {tag: "TraceSignature", values: readonly [u64]};
 
 export interface Client {
+  add_signing_key: ({agent, public_key, proof_sig}: {agent: string, public_key: Buffer, proof_sig: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  retire_signing_key: ({agent, public_key}: {agent: string, public_key: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<void>>>
+  get_signing_keys: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Array<Buffer>>>
+  get_key_agent: ({public_key}: {public_key: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Option<string>>>
+  signing_key_history_count: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<u32>>
+  signing_key_history: ({agent, start, limit}: {agent: string, start: u32, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Array<SigningKeyRecord>>>>
+  publish_trace_signed: ({agent, market_id, action, trace_hash, ipfs_cid, signing_key, signature}: {agent: string, market_id: u64, action: TraceAction, trace_hash: Buffer, ipfs_cid: string, signing_key: Buffer, signature: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  publish_chained_trace_signed: ({agent, market_id, action, trace_hash, ipfs_cid, expected_seq, prev_trace_hash, signing_key, signature}: {agent: string, market_id: u64, action: TraceAction, trace_hash: Buffer, ipfs_cid: string, expected_seq: u64, prev_trace_hash: Buffer, signing_key: Buffer, signature: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  get_trace_signature: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Option<readonly [Buffer, Buffer]>>>
+  verify_trace_signature: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
   get_trace: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Trace>>>
   trace_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
   verify_trace: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
@@ -200,6 +226,16 @@ export class Client extends ContractClient {
     agent_batch_at: this.txFromJSON<Result<u64>>,
     verify_trace_inclusion: this.txFromJSON<Result<boolean>>,
     compute_merkle_root: this.txFromJSON<Result<Buffer>>,
+    add_signing_key: this.txFromJSON<Result<void>>,
+    retire_signing_key: this.txFromJSON<Result<void>>,
+    get_signing_keys: this.txFromJSON<Array<Buffer>>,
+    get_key_agent: this.txFromJSON<Option<string>>,
+    signing_key_history_count: this.txFromJSON<u32>,
+    signing_key_history: this.txFromJSON<Result<Array<SigningKeyRecord>>>,
+    publish_trace_signed: this.txFromJSON<Result<u64>>,
+    publish_chained_trace_signed: this.txFromJSON<Result<u64>>,
+    get_trace_signature: this.txFromJSON<Option<readonly [Buffer, Buffer]>>,
+    verify_trace_signature: this.txFromJSON<Result<boolean>>,
     is_registered: this.txFromJSON<boolean>,
     get_agent: this.txFromJSON<Option<AgentRecord>>,
     publish_trace: this.txFromJSON<Result<u64>>,
