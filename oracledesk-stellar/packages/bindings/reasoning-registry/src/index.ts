@@ -34,13 +34,43 @@ if (typeof window !== "undefined") {
 
 
 export const Errors = {
-  1: {message:"NotInitialized"},
-  2: {message:"Unauthorized"},
-  3: {message:"AgentAlreadyRegistered"},
-  4: {message:"AgentNotRegistered"},
-  5: {message:"TraceNotFound"},
-  6: {message:"EmptyAction"},
-  7: {message:"EmptyCid"}
+  3001: {message:"NotInitialized"},
+  3002: {message:"Unauthorized"},
+  3003: {message:"AgentAlreadyRegistered"},
+  3004: {message:"AgentNotRegistered"},
+  3005: {message:"TraceNotFound"},
+  3006: {message:"EmptyAction"},
+  3007: {message:"EmptyCid"},
+  3008: {message:"ChainHeadMismatch"},
+  3009: {message:"ChainedAgentMustChain"},
+  3010: {message:"TraceAlreadyConsumed"},
+  3011: {message:"ActionTooLong"},
+  3012: {message:"CidTooLong"},
+  3013: {message:"PageTooLarge"}
+}
+
+
+/**
+ * One `(trace_id, Trace)` pair in a {@link TracePage} (#57).
+ *
+ * NOTE: hand-updated for the #57 interface change. The embedded `ContractSpec`
+ * XDR below was **not** regenerated (this change was authored without the
+ * Stellar CLI / Rust toolchain available). Run `make bindings` with the pinned
+ * toolchain before deploying so the spec and this file agree.
+ */
+export interface TracePageEntry {
+  trace: Trace;
+  trace_id: u64;
+}
+
+/**
+ * A page of traces returned by one simulation, plus the cursor to fetch the
+ * next page (#57). `next == total` means the caller has seen everything.
+ */
+export interface TracePage {
+  entries: Array<TracePageEntry>;
+  next: u64;
+  total: u64;
 }
 
 
@@ -53,7 +83,7 @@ export interface Trace {
   trace_hash: Buffer;
 }
 
-export type DataKey = {tag: "Admin", values: void} | {tag: "NextId", values: void} | {tag: "Agent", values: readonly [string]} | {tag: "Trace", values: readonly [u64]} | {tag: "MarketTraceCount", values: readonly [u64]} | {tag: "MarketTrace", values: readonly [u64, u64]};
+export type DataKey = {tag: "Admin", values: void} | {tag: "NextId", values: void} | {tag: "Agent", values: readonly [string]} | {tag: "Trace", values: readonly [u64]} | {tag: "MarketTraceCount", values: readonly [u64]} | {tag: "MarketTrace", values: readonly [u64, u64]} | {tag: "AgentTraceCount", values: readonly [string]} | {tag: "AgentTraceAt", values: readonly [string, u64]} | {tag: "MarketActionTraceCount", values: readonly [u64, string]} | {tag: "MarketActionTraceAt", values: readonly [u64, string, u64]};
 
 
 
@@ -105,6 +135,41 @@ export interface Client {
    */
   market_trace_count: ({market_id}: {market_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<u64>>
 
+  /**
+   * Construct and simulate an agent_trace_count transaction (#57).
+   */
+  agent_trace_count: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+
+  /**
+   * Construct and simulate an agent_trace_at transaction (#57).
+   */
+  agent_trace_at: ({agent, index}: {agent: string, index: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+
+  /**
+   * Construct and simulate a market_action_trace_count transaction (#57).
+   */
+  market_action_trace_count: ({market_id, action}: {market_id: u64, action: string}, options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+
+  /**
+   * Construct and simulate a market_action_trace_at transaction (#57).
+   */
+  market_action_trace_at: ({market_id, action, index}: {market_id: u64, action: string, index: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+
+  /**
+   * Construct and simulate a traces_by_market transaction (#57).
+   */
+  traces_by_market: ({market_id, start, limit}: {market_id: u64, start: u64, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TracePage>>>
+
+  /**
+   * Construct and simulate a traces_by_agent transaction (#57).
+   */
+  traces_by_agent: ({agent, start, limit}: {agent: string, start: u64, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TracePage>>>
+
+  /**
+   * Construct and simulate a traces_by_market_action transaction (#57).
+   */
+  traces_by_market_action: ({market_id, action, start, limit}: {market_id: u64, action: string, start: u64, limit: u32}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TracePage>>>
+
 }
 export class Client extends ContractClient {
   static async deploy<T = Client>(
@@ -152,6 +217,13 @@ export class Client extends ContractClient {
         register_agent: this.txFromJSON<Result<void>>,
         market_trace_at: this.txFromJSON<Result<u64>>,
         unregister_agent: this.txFromJSON<Result<void>>,
-        market_trace_count: this.txFromJSON<u64>
+        market_trace_count: this.txFromJSON<u64>,
+        agent_trace_count: this.txFromJSON<u64>,
+        agent_trace_at: this.txFromJSON<Result<u64>>,
+        market_action_trace_count: this.txFromJSON<u64>,
+        market_action_trace_at: this.txFromJSON<Result<u64>>,
+        traces_by_market: this.txFromJSON<Result<TracePage>>,
+        traces_by_agent: this.txFromJSON<Result<TracePage>>,
+        traces_by_market_action: this.txFromJSON<Result<TracePage>>
   }
 }
