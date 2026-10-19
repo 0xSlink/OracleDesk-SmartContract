@@ -16,6 +16,8 @@ mod market_core {
 }
 use market_core::{Category, Client as MarketCoreClient, MarketStatus, Outcome};
 
+pub mod correlation;
+
 const DAY_SECONDS: u64 = 86_400;
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
@@ -307,6 +309,10 @@ pub enum Error {
     InvalidPricePolicy = 26,
     SlippageExceeded = 27,
     NotPaused = 28,
+    /// Category exposure would exceed its correlation cap (#49).
+    CategoryCapExceeded = 29,
+    /// Close-date bucket exposure would exceed its cap (#49).
+    BucketCapExceeded = 30,
 }
 
 #[contractevent]
