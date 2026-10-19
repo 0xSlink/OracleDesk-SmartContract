@@ -91,11 +91,10 @@ for f in market_core resolver reasoning_registry treasury; do
 done
 
 # contractimport! (resolver, treasury) reads a vendored copy of
-# market-core's wasm at *their* compile time — keep it fresh before
-# rebuilding them. See docs/adr/0002-cross-contract-calls.md.
-cp "$WASM_DIR/market_core.wasm" contracts/resolver/market_core.wasm
-cp "$WASM_DIR/market_core.wasm" contracts/treasury/market_core.wasm
-cp "$WASM_DIR/reasoning_registry.wasm" contracts/resolver/reasoning_registry.wasm
+# market-core's wasm at *their* compile time — refresh the copies and their
+# committed sha256 pins before rebuilding them (#58). See
+# docs/adr/0002-cross-contract-calls.md.
+./scripts/sync-vendored-wasm.sh
 stellar contract build
 
 # --- identities -------------------------------------------------------------
