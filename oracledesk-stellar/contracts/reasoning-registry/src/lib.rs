@@ -46,6 +46,9 @@ pub struct TraceBatch {
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
+/// How long a pending admin proposal stays acceptable.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum TraceAction {
@@ -108,6 +111,7 @@ pub struct Trace {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     NextId,
     Agent(Address),
     Trace(u64),
@@ -174,6 +178,14 @@ pub struct ChainLink {
     pub prev_trace_hash: BytesN<32>,
 }
 
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -192,108 +204,28 @@ pub enum Error {
     ChainedAgentMustChain = 9,
     /// Trace already backed an action (#50).
     TraceAlreadyConsumed = 10,
-    /// Agent is retired or revoked (#56).
-    AgentNotActive = 11,
-    /// A revoked agent cannot be reactivated (#56).
-    CannotReactivateRevoked = 12,
-    /// Trace flag history exceeds maximum 16 entries (#56).
-    FlagHistoryFull = 13,
-    /// Revocation effective_from is invalid (#56).
-    InvalidEffectiveTime = 14,
-    /// market_id has not been issued by market-core (#55).
-    UnknownMarket = 15,
-    /// Action requires a valid market_id instead of NO_MARKET (#55).
-    MarketRequired = 16,
-    /// ProposeMarket action must use NO_MARKET sentinel (#55).
-    ProposalMustUseNoMarket = 17,
-    /// Other(Symbol) shadows a canonical TraceAction name (#55).
-    UseCanonicalAction = 18,
-    /// Batch does not exist (#54).
-    BatchNotFound = 19,
-    /// Batch parameters are invalid (leaf_count out of bounds or empty manifest) (#54).
-    InvalidBatch = 20,
-    /// Inclusion proof is invalid or malformed (#54).
-    InvalidProof = 21,
-    /// Agent signing key list is full (max 4 active keys) (#53).
-    TooManyKeys = 22,
-    /// Key is already bound to an agent (#53).
-    KeyAlreadyBound = 23,
-    /// Signing key is invalid, unknown, or not authorized (#53).
-    InvalidKey = 24,
-    /// Ed25519 signature verification failed (#53).
-    InvalidSignature = 25,
-    /// Requested trace does not have an attestation signature (#53).
-    TraceNotSigned = 26,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 11,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 12,
 }
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentSigningKeyAdded {
-    #[topic]
-    pub agent: Address,
-    #[topic]
-    pub public_key: BytesN<32>,
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
 }
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentSigningKeyRetired {
-    #[topic]
-    pub agent: Address,
-    #[topic]
-    pub public_key: BytesN<32>,
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
 }
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TraceSigned {
-    #[topic]
-    pub trace_id: u64,
-    #[topic]
-    pub agent: Address,
-    #[topic]
-    pub signing_key: BytesN<32>,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentRetired {
-    #[topic]
-    pub agent: Address,
-    pub at: u64,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentRevoked {
-    #[topic]
-    pub agent: Address,
-    pub effective_from: u64,
-    pub reason: Symbol,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct AgentReactivated {
-    #[topic]
-    pub agent: Address,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TraceFlagged {
-    #[topic]
-    pub trace_id: u64,
-    pub reason: Symbol,
-}
-
-#[contractevent]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct TraceUnflagged {
-    #[topic]
-    pub trace_id: u64,
-    pub reason: Symbol,
-}
+pub struct AdminTransferCancelled {}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -374,6 +306,68 @@ impl ReasoningRegistry {
         env.storage().instance().set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
         env.storage().instance().set(&DataKey::NextBatchId, &0u64);
+    }
+
+    // ----- admin ----------------------------------------------------------
+
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
+    }
+
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
     }
 
     pub fn register_agent(env: Env, agent: Address) -> Result<(), Error> {
@@ -827,6 +821,11 @@ impl ReasoningRegistry {
             .get(&DataKey::AgentBatchCount(agent))
             .unwrap_or(0)
     }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
+}
 
     pub fn agent_batch_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
         let key = DataKey::AgentBatch(agent, index);
@@ -2985,5 +2984,103 @@ mod test {
             client.try_verify_trace_signature(&trace_id),
             Err(Ok(Error::TraceNotSigned))
         );
+    }
+    #[test]
+    fn two_step_admin_transfer() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        assert_eq!(client.admin(), admin);
+        assert_eq!(client.pending_admin(), None);
+
+        client.propose_admin(&new_admin);
+        assert_eq!(
+            client.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
+        );
+        client.accept_admin();
+        assert_eq!(client.admin(), new_admin);
+        assert_eq!(client.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_transfer_can_be_cancelled() {
+        let (env, client, _, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        client.cancel_admin_transfer();
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(client.try_accept_admin(), Err(Ok(Error::NoPendingAdmin)));
+    }
+
+    #[test]
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let (env, client, _, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
+        assert_eq!(
+            client.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
+        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(client
+            .pending_admin()
+            .map(|p| p.expires_at < env.ledger().timestamp())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_accept_admin() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        let bystander = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &bystander,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let (env, client, _, _) = setup();
+        let not_admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
     }
 }
