@@ -3,7 +3,9 @@
 use soroban_sdk::{
     auth::{ContractContext, InvokerContractAuthEntry, SubContractInvocation},
     contract, contracterror, contractevent, contractimpl, contracttype, panic_with_error, token,
-    vec, Address, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
+    vec,
+    xdr::ToXdr,
+    Address, Bytes, BytesN, Env, IntoVal, String, Symbol, Val, Vec,
 };
 
 // See the comment on the equivalent `mod market_core` in
@@ -15,6 +17,23 @@ mod market_core {
     soroban_sdk::contractimport!(file = "market_core.wasm");
 }
 use market_core::{Category, Client as MarketCoreClient, MarketStatus, Outcome};
+
+// The resolver's wasm supplies the `register_spec_v2` client and the
+// `ResolutionSpecV2`/`ResolutionSpec` types used by the atomic
+// `agent_create_market_and_reveal` flow (#64). Same duplicate-`__constructor`
+// rationale as above; the resolver wasm is vendored at the workspace root and
+// refreshed by `make build`.
+#[allow(clippy::too_many_arguments)]
+mod resolver {
+    soroban_sdk::contractimport!(file = "resolver.wasm");
+}
+use resolver::{Client as ResolverClient, ResolutionSpec, ResolutionSpecV2};
+
+/// Domain tag prepended to a V2 spec before hashing. Mirrors the resolver's
+/// `SPEC_DOMAIN` so the treasury can compute the commitment it will both
+/// create the market with and reveal.
+const SPEC_DOMAIN: &[u8] = b"oracledesk:resolution-spec";
+const SPEC_V2_VERSION: u32 = 2;
 
 pub mod correlation;
 
@@ -46,6 +65,9 @@ pub const ROLE_ALL: u32 = ROLE_CREATE | ROLE_TRADE | ROLE_SETTLE;
 pub const MAX_AGENTS: u32 = 16;
 /// Floor for `config_delay` (one day).
 pub const MIN_CONFIG_DELAY: u64 = 86_400;
+
+/// How long a pending admin proposal stays acceptable.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
 /// Bounds `nav()` to this many markets x two cross-contract reads. Each read
 /// instantiates market-core (~2.5 MB of memory per market): 32 markets
 /// measured ~81 MB for `nav()` alone and 16 ~40.4 MB for a `deposit`,
@@ -229,6 +251,7 @@ pub struct WithdrawTicket {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     /// Legacy `RiskConfig`; migrated into `Global` plus one full-role agent
     /// by `load_global`.
     Config,
@@ -277,6 +300,14 @@ pub enum DataKey {
 /// market-core's own codes, which overlap these numerically (e.g. its
 /// `NotFinal = 11`). The one market-core error a trade's own bounds can
 /// cause, `SlippageExceeded`, is remapped to [`Error::SlippageExceeded`].
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
@@ -313,7 +344,31 @@ pub enum Error {
     CategoryCapExceeded = 29,
     /// Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 30,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 31,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 32,
+    /// `agent_create_market_and_reveal` was given a malformed resolution
+    /// envelope or a rule outside the two primary modes (#64).
+    InvalidResolution = 33,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -573,6 +628,11 @@ pub const DEFAULT_PRICE_POLICY: PricePolicy = PricePolicy {
 #[contract]
 pub struct Treasury;
 
+#[soroban_sdk::contractclient(name = "MarketCoreWiringClient")]
+pub trait MarketCoreWiring {
+    fn accept_treasury(env: Env) -> Result<(), soroban_sdk::Error>;
+}
+
 #[contractimpl]
 impl Treasury {
     /// Registers `agent` as the first agent with every role and the global
@@ -653,6 +713,77 @@ impl Treasury {
 
     pub fn get_global(env: Env) -> Result<GlobalConfig, Error> {
         Self::load_global(&env)
+    }
+
+    pub fn market_core(env: Env) -> Address {
+        Self::load_global(&env).unwrap().market_core
+    }
+
+    pub fn accept_market_core_role(env: Env) {
+        let core = Self::market_core(env.clone());
+        MarketCoreWiringClient::new(&env, &core).accept_treasury();
+    }
+
+    // ----- admin ----------------------------------------------------------
+
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
+    }
+
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
     }
 
     /// Raw collateral balance. Part of it may be owed to queued withdrawals
@@ -1365,6 +1496,46 @@ impl Treasury {
         Ok(market_id)
     }
 
+    /// Like [`Treasury::agent_create_market`], but reveals the resolution rule
+    /// in the same transaction (#64). The market is created with the commitment
+    /// derived from `spec_v2` itself, so the follow-up reveal necessarily
+    /// matches and the market can never be left unresolvable. `resolver` is the
+    /// deployed resolver contract; it must be configured for this treasury's
+    /// market-core.
+    ///
+    /// The router cannot serve this path: seeding pulls collateral from the
+    /// treasury contract (not the end user) via a contract self-authorization,
+    /// which only this contract can perform — a stateless router between the
+    /// agent and market-core would not be authorized on the token.
+    #[allow(clippy::too_many_arguments)]
+    pub fn agent_create_market_and_reveal(
+        env: Env,
+        agent: Address,
+        resolver: Address,
+        question_hash: BytesN<32>,
+        meta_uri: String,
+        category: Category,
+        close_time: u64,
+        seed_amount: i128,
+        initial_yes_bps: u32,
+        spec_v2: ResolutionSpecV2,
+    ) -> Result<u64, Error> {
+        let resolution_hash = Self::resolve_commitment(&env, &spec_v2)?;
+        let market_id = Self::agent_create_market(
+            env.clone(),
+            agent.clone(),
+            question_hash,
+            resolution_hash,
+            meta_uri,
+            category,
+            close_time,
+            seed_amount,
+            initial_yes_bps,
+        )?;
+        ResolverClient::new(&env, &resolver).register_spec_v2(&market_id, &spec_v2);
+        Ok(market_id)
+    }
+
     /// Buys `outcome` shares in an existing market using treasury capital
     /// (`ROLE_TRADE`). Price-checked, see `do_agent_buy`.
     pub fn agent_buy(
@@ -1643,6 +1814,10 @@ impl Treasury {
             .ok_or(Error::NotInitialized)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     fn is_paused(env: &Env) -> bool {
@@ -2062,6 +2237,35 @@ impl Treasury {
     }
 
     /// Agents may never spend collateral owed to queued withdrawals.
+    /// The commitment an `agent_create_market_and_reveal` will both create the
+    /// market with and reveal: `sha256(SPEC_DOMAIN || XDR(spec))`, matching the
+    /// resolver's `spec_v2_hash`. Validates the envelope and the two primary
+    /// rule variants locally so a malformed rule never creates a market.
+    fn resolve_commitment(env: &Env, spec: &ResolutionSpecV2) -> Result<BytesN<32>, Error> {
+        if spec.version != SPEC_V2_VERSION || spec.salt == BytesN::from_array(env, &[0; 32]) {
+            return Err(Error::InvalidResolution);
+        }
+        if spec.network_id != env.ledger().network_id() {
+            return Err(Error::InvalidResolution);
+        }
+        let valid = match &spec.rule {
+            ResolutionSpec::Price(cfg) => cfg.threshold >= 0 && cfg.max_staleness != 0,
+            ResolutionSpec::Signers(cfg) => {
+                !cfg.signers.is_empty()
+                    && cfg.threshold != 0
+                    && cfg.threshold <= cfg.signers.len()
+                    && cfg.dispute_window != 0
+            }
+            _ => false,
+        };
+        if !valid {
+            return Err(Error::InvalidResolution);
+        }
+        let mut preimage = Bytes::from_slice(env, SPEC_DOMAIN);
+        preimage.append(&spec.clone().to_xdr(env));
+        Ok(env.crypto().sha256(&preimage).into())
+    }
+
     fn ensure_unreserved(env: &Env, global: &GlobalConfig, amount: i128) -> Result<(), Error> {
         let reserved = Self::reserved(env);
         if reserved == 0 {
@@ -5556,5 +5760,195 @@ mod test {
             "agent_buy (price-checked: get_price x2 + quote_buy): {with_checks} instructions"
         );
         assert!(with_checks < 100_000_000);
+    }
+
+    #[test]
+    fn two_step_admin_transfer() {
+        let f = fixture();
+        let new_admin = Address::generate(&f.env);
+        assert_eq!(f.treasury.admin(), f.admin);
+        assert_eq!(f.treasury.pending_admin(), None);
+
+        f.treasury.propose_admin(&new_admin);
+        assert_eq!(
+            f.treasury.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
+        );
+        f.treasury.accept_admin();
+        assert_eq!(f.treasury.admin(), new_admin);
+        assert_eq!(f.treasury.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_transfer_can_be_cancelled() {
+        let f = fixture();
+        let new_admin = Address::generate(&f.env);
+        f.treasury.propose_admin(&new_admin);
+        f.treasury.cancel_admin_transfer();
+        assert_eq!(f.treasury.pending_admin(), None);
+        assert_eq!(
+            f.treasury.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+    }
+
+    #[test]
+    fn wrong_caller_cannot_accept_admin() {
+        let f = fixture();
+        let new_admin = Address::generate(&f.env);
+        f.treasury.propose_admin(&new_admin);
+        let bystander = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &bystander,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+        assert_eq!(f.treasury.admin(), f.admin);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let f = fixture();
+        let not_admin = Address::generate(&f.env);
+        let new_admin = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(f
+            .treasury
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &f.treasury_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
+    }
+
+    #[test]
+    fn agent_create_market_and_reveal_is_atomic() {
+        let env = Env::default();
+        env.mock_all_auths();
+        env.ledger().set_timestamp(1_000);
+        env.ledger().set_network_id([7u8; 32]);
+
+        let admin = Address::generate(&env);
+        let agent = Address::generate(&env);
+        let treasury_id = Address::generate(&env);
+        let collateral = env.register_stellar_asset_contract_v2(admin.clone());
+        let token = StellarAssetClient::new(&env, &collateral.address());
+        token.mint(&treasury_id, &(1_000 * 10_000_000_i128));
+
+        let market_core_id = env.register(
+            market_core::WASM,
+            (
+                admin.clone(),
+                collateral.address(),
+                treasury_id.clone(),
+                Address::generate(&env),
+                100u32,
+                10_000u32,
+            ),
+        );
+        let resolver_id = env.register(resolver::WASM, (admin.clone(), market_core_id.clone()));
+        let treasury = TreasuryClient::new(
+            &env,
+            &env.register_at(
+                &treasury_id,
+                Treasury,
+                TreasuryArgs::__constructor(
+                    &admin,
+                    &agent,
+                    &collateral.address(),
+                    &market_core_id,
+                    &(200 * 10_000_000_i128),
+                    &(500 * 10_000_000_i128),
+                    &(1_000 * 10_000_000_i128),
+                    &(1_000 * 10_000_000_i128),
+                    &DELAY,
+                ),
+            ),
+        );
+        install_price_policy(&env, &treasury_id, PERMISSIVE);
+
+        let signer = Address::generate(&env);
+        let spec = ResolutionSpecV2 {
+            version: 2,
+            network_id: BytesN::from_array(&env, &[7u8; 32]),
+            market_core: market_core_id.clone(),
+            salt: BytesN::from_array(&env, &[5u8; 32]),
+            rule: ResolutionSpec::Signers(resolver::SignerConfig {
+                signers: vec![&env, signer],
+                threshold: 1,
+                dispute_window: 100,
+            }),
+        };
+        let market_id = treasury.agent_create_market_and_reveal(
+            &agent,
+            &resolver_id,
+            &BytesN::from_array(&env, &[9u8; 32]),
+            &String::from_str(&env, "ipfs://atomic"),
+            &Category::Crypto,
+            &MARKET_CLOSE,
+            &(100 * 10_000_000_i128),
+            &5000u32,
+            &spec,
+        );
+        // The market exists with the commitment derived from the revealed
+        // spec, so it can never be an unresolvable market.
+        let core = MarketCoreClient::new(&env, &market_core_id);
+        let market = core.get_market(&market_id);
+        assert_eq!(market.resolution_hash, resolve_hash(&env, &spec));
+    }
+
+    /// Test-local mirror of the resolver's `spec_v2_hash`.
+    fn resolve_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
+        let mut preimage = Bytes::from_slice(env, b"oracledesk:resolution-spec");
+        preimage.append(&spec.clone().to_xdr(env));
+        env.crypto().sha256(&preimage).into()
+    }
+
+    #[test]
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let f = fixture();
+        let new_admin = Address::generate(&f.env);
+        f.treasury.propose_admin(&new_admin);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
+        assert_eq!(
+            f.treasury.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
+        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(f
+            .treasury
+            .pending_admin()
+            .map(|p| p.expires_at < f.env.ledger().timestamp())
+            .unwrap_or(false));
     }
 }

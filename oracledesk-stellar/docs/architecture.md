@@ -26,7 +26,7 @@ fee split below), and `reserve_yes + Σ(user yes positions) == sets_minted`
 
 **Fee split and recipient snapshot.** `create_market` snapshots a
 `FeeTerms { recipient, protocol_share_bps }` side entry per market, so
-`set_treasury` / `set_protocol_fee_share_bps` only affect markets created
+`propose_treasury` / `set_protocol_fee_share_bps` only affect markets created
 after them. Each trade's fee is split once at accrual time
 (`math::split_fee`, protocol shares round up so `protocol + lp == fee`
 exactly): the protocol portion accumulates in `Market.fees_accrued` and is
@@ -363,7 +363,8 @@ are: the old core is recorded as legacy, `legacy_redeem` /
 `legacy_claim_pool_remainder` recover them, and exposure for any later core
 is kept under keys namespaced by core address (the original core keeps the
 old `Market(id)` / `Net(id)` keys) so restarted market ids cannot collide.
-The new core still needs its own `set_treasury` for fee sweeps. This bounds
+The new core still needs its own `propose_treasury` handshake for fee sweeps.
+This bounds
 what a compromised admin can unlock *for the agents*; it is not a custody
 control (see "Vault" and SECURITY.md).
 
@@ -443,6 +444,42 @@ unbounded `Vec`, so the index never has an unbounded-growth storage cost.
 events. An indexer (Soroban events → Postgres, replayable) is required for
 any UI that wants to list traces/trades older than that window — this is
 one of the seeded `docs/wave-issues/`.
+
+### router
+
+A stateless address book (`RouterConfig { market_core, resolver,
+reasoning_registry }`) plus atomic multi-step entrypoints, so a client cannot
+half-apply a flow or point it at a hostile resolver (ADR 0009):
+`create_and_reveal_signers` / `create_and_reveal_price` (create the market and
+reveal its rule in one transaction; the commitment is computed locally from
+the spec), `reveal_spec` (the deferred commit-now/reveal-later path), and
+`buy_and_publish_trace` (buy through market-core and publish the reasoning
+trace together, so a trade cannot drop its trace). It holds no funds and has
+no admin.
+
+### Governance: wiring, admin transfer, timelock
+
+- **Authenticated wiring (ADR 0006).** `market-core` no longer lets the admin
+  set the resolver/treasury directly. It `propose_resolver` /
+  `propose_treasury`; the target must then prove, by calling back
+  `market_core()`, that it is configured for this market-core before it takes
+  the role. Every change emits `ResolverProposed`/`ResolverChanged` (and the
+  treasury equivalents). Deploys are deterministic (`--salt`), so the real
+  addresses are known before `market-core`'s constructor runs and there is no
+  placeholder window.
+- **Two-step admin transfer (ADR 0007).** All four core contracts (and the
+  timelock) expose `propose_admin`/`accept_admin`/`cancel_admin_transfer` with
+  a seven-day expiry. The new admin must accept, so a proposal to an address
+  the operator does not control never lands; `new_admin` may be a classic
+  multisig account, a smart-account multisig, or the timelock.
+- **Timelock (ADR 0008).** `contracts/timelock` separates the proposer,
+  canceller, executor and emergency roles and imposes a delay
+  (`MIN_DELAY = 1 day`) between `schedule` and `execute`, with a seven-day
+  execution grace and a `cancel` veto. `emergency` bypasses the delay for
+  `set_paused(true)` / `cancel_proposal` only. Pointing the core contracts'
+  admin at the timelock (deploy with `USE_TIMELOCK=1`, or migrate with
+  `scripts/wire-timelock.sh`) removes any single key's ability to change a
+  live market instantly.
 
 ## Off-chain pieces
 
