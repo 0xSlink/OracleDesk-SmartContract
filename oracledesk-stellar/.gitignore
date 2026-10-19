@@ -39,3 +39,7 @@ deployments/specs/
 .vscode/
 .idea/
 .DS_Store
+
+# Python
+__pycache__/
+*.pyc

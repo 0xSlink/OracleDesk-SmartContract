@@ -1,6 +1,6 @@
 #![no_std]
 
-mod math;
+pub mod math;
 
 use math::{MathError, Settlement, BPS, MAX_SETS};
 use soroban_sdk::{

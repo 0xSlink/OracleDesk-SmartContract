@@ -319,13 +319,7 @@ pub struct BlendPositions {
 
 #[soroban_sdk::contractclient(name = "BlendPoolClient")]
 pub trait BlendPool {
-    fn submit(
-        env: Env,
-        from: Address,
-        spender: Address,
-        to: Address,
-        requests: Vec<BlendRequest>,
-    );
+    fn submit(env: Env, from: Address, spender: Address, to: Address, requests: Vec<BlendRequest>);
     fn get_positions(env: Env, address: Address) -> BlendPositions;
 }
 
@@ -455,9 +449,9 @@ pub enum Error {
     YieldWithdrawFailed = 42,
     VenueHasPrincipal = 43,
     /// Category exposure would exceed its correlation cap (#49).
-    CategoryCapExceeded = 29,
+    CategoryCapExceeded = 44,
     /// Close-date bucket exposure would exceed its cap (#49).
-    BucketCapExceeded = 30,
+    BucketCapExceeded = 45,
 }
 
 #[contractevent]
@@ -3345,13 +3339,7 @@ impl Treasury {
         Ok(())
     }
 
-    fn authorize_transfer(
-        env: &Env,
-        token: &Address,
-        from: &Address,
-        to: &Address,
-        amount: i128,
-    ) {
+    fn authorize_transfer(env: &Env, token: &Address, from: &Address, to: &Address, amount: i128) {
         env.authorize_as_current_contract(vec![
             env,
             InvokerContractAuthEntry::Contract(SubContractInvocation {
@@ -3389,7 +3377,10 @@ impl Treasury {
         }
     }
 
-    fn validate_creation_policy(global: &GlobalConfig, policy: &CreationPolicy) -> Result<(), Error> {
+    fn validate_creation_policy(
+        global: &GlobalConfig,
+        policy: &CreationPolicy,
+    ) -> Result<(), Error> {
         if policy.max_seed <= 0 || policy.max_seed > global.max_market {
             return Err(Error::InvalidConfig);
         }
@@ -3452,7 +3443,10 @@ impl Treasury {
             let last_idx = active_buckets.len() - 1;
             let mut last = active_buckets.get(last_idx).unwrap();
             if last.bucket_start == cur_start {
-                last.count = last.count.checked_add(1).ok_or(Error::CreationRateExceeded)?;
+                last.count = last
+                    .count
+                    .checked_add(1)
+                    .ok_or(Error::CreationRateExceeded)?;
                 active_buckets.set(last_idx, last);
                 updated = true;
             }
@@ -3500,7 +3494,9 @@ impl Treasury {
     }
 
     fn save_pnl(env: &Env, market_id: u64, pnl: &MarketPnl) {
-        env.storage().persistent().set(&DataKey::Pnl(market_id), pnl);
+        env.storage()
+            .persistent()
+            .set(&DataKey::Pnl(market_id), pnl);
         Self::bump_persistent(env, &DataKey::Pnl(market_id));
     }
 
@@ -3672,7 +3668,11 @@ impl Treasury {
         if liquid >= needed {
             return Ok(());
         }
-        let venue: YieldVenue = match env.storage().instance().get::<_, YieldVenue>(&DataKey::YieldVenue) {
+        let venue: YieldVenue = match env
+            .storage()
+            .instance()
+            .get::<_, YieldVenue>(&DataKey::YieldVenue)
+        {
             Some(v) if v.enabled => v,
             _ => return Err(Error::InsufficientBalance),
         };
@@ -7464,9 +7464,7 @@ mod test {
         let f = fixture_with_policy(100 * USDC, 500 * USDC, 500 * USDC, policy);
 
         for day in 0..30 {
-            f.env
-                .ledger()
-                .set_timestamp(1_000 + (day as u64) * 86_400);
+            f.env.ledger().set_timestamp(1_000 + (day as u64) * 86_400);
             let close = f.env.ledger().timestamp() + 1000;
             let mut byte_arr = [0u8; 32];
             byte_arr[0] = (day + 1) as u8;
@@ -7824,4 +7822,3 @@ mod test {
         assert_eq!(err, Err(Ok(Error::VenueHasPrincipal)));
     }
 }
-

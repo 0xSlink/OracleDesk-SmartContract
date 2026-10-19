@@ -19,7 +19,9 @@ base units (USDC on Stellar = 7 decimals). Rounding always favours the pool.
 
 from dataclasses import dataclass
 from math import isqrt
+import json
 import random
+from pathlib import Path
 
 BPS = 10_000
 MAX_SETS = 1_000_000_000_000_000  # 1e15 = 100M USDC (7 dp)
@@ -325,8 +327,47 @@ def _check_limits_boundary_and_symmetry():
     assert not buy_within_limit(1, 1, 0)
 
 
+def _check_shared_vectors():
+    """Replays the committed cross-language vectors.
+
+    The same file is asserted by math.rs::shared_vectors_match and
+    agents/core/fpmm.test.ts, so a porting mistake is caught even when the
+    differential harness (scripts/fpmm-diff/diff.py) is not running.
+    """
+    path = Path(__file__).resolve().parents[1] / "scripts/fpmm-diff/vectors.jsonl"
+    for line_no, line in enumerate(path.read_text().splitlines(), 1):
+        case = json.loads(line)
+        fn = case["fn"]
+        args = case["args"]
+        parsers = {
+            "calc_buy": lambda a: calc_buy(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
+            "calc_sell": lambda a: calc_sell(int(a[0]), int(a[1]), int(a[2]), int(a[3])),
+            "seed_reserves": lambda a: seed_reserves(int(a[0]), int(a[1])),
+            "mul_div_floor": lambda a: {"value": mul_div_floor(int(a[0]), int(a[1]), int(a[2]))},
+            "mul_div_ceil": lambda a: {"value": mul_div_ceil(int(a[0]), int(a[1]), int(a[2]))},
+            "price_yes_bps": lambda a: {"value": price_yes_bps(int(a[0]), int(a[1]))},
+            "settle_value": lambda a: {"value": settle_value(a[0], int(a[1]), int(a[2]))},
+            "gross_for_shares": lambda a: {"gross": gross_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))},
+            "collateral_out_for_shares": lambda a: {
+                "collateral_out": collateral_out_for_shares(int(a[0]), int(a[1]), int(a[2]), int(a[3]))
+            },
+        }
+        try:
+            out = parsers[fn](args)
+        except MathError as exc:
+            assert "err" in case, f"vector line {line_no}: unexpected error {exc}"
+            continue
+        if hasattr(out, "__dict__"):
+            out = dict(out.__dict__)
+        assert "ok" in case, f"vector line {line_no}: expected an error"
+        assert {k: str(v) for k, v in out.items()} == case["ok"], (
+            f"vector line {line_no} ({fn}) mismatch: {out} != {case['ok']}"
+        )
+
+
 def run_all():
     _check_known_values()
+    _check_shared_vectors()
     _check_seed_opens_at_requested_probability()
     _check_k_never_decreases_and_round_trip_never_profits()
     _check_gross_for_shares_inverts_calc_sell()
