@@ -422,6 +422,44 @@ implemented: it would record provenance only, and the events plus the
 successor's own exposure records are enough for an off-chain dashboard
 ([wave-issue 08](wave-issues/08-treasury-exposure-dashboard.md)).
 
+**Permissionless settlement & exposure release (#45).** Settle market capital
+without depending on hot agent keys: `settle_market(caller, market_id)` is
+permissionless and idempotent. It redeems the treasury's outcome-share position if
+any, claims the LP remainder if the treasury created the market, marks market exposure
+closed (`open = false`), and records realized proceeds under `Realized(market_id)`.
+Calls to `market-core` use generated `try_` client methods so expected core errors
+(`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`) map cleanly to 0 or distinct treasury
+errors without unhandled transaction aborts. Settlement operates even when the treasury
+is paused (stopping trading, not fund recovery).
+
+**Realized PnL & auto-pause on drawdown (#46).** Cumulative losses across markets
+are bounded by an automated drawdown guard. The treasury tracks collateral cost
+(buys and market seeds) and proceeds (sells, redemptions, LP remainders) per market
+(`MarketPnl`). PnL is realized once a market is final and all positions/LP claims are settled
+(or via permissionless `realize(market_id)` for pre-close exits). A rolling window of daily
+buckets advances lazily, summing net realized PnL across `window_days`. If `window_pnl < -max_drawdown`,
+the contract trips into drawdown pause (`DrawdownTripped` instance flag, emitting `DrawdownPause`).
+In this mode, buys and creations are blocked, but `agent_sell` remains open (reduce-only) to avoid
+trapping positions. Resuming requires admin `acknowledge_drawdown()` before unpausing. Third parties
+triggering settlements cannot manipulate loss magnitude, only realization timing. Protocol fees and
+external donations are strictly excluded from PnL accounting.
+
+**Market-creation risk controls (#47).** Market seeds are decoupled from trade caps
+via a dedicated `CreationPolicy` (max seed, rolling creation count limit, close horizon
+bounds, allowed category bitmask). Stored in instance storage with bounded bucket arrays
+(`CREATION_BUCKETS = 24`), creation limits are enforced before any cross-contract calls.
+Admin policy updates are tighten-only (`set_creation_policy`), preventing a compromised key
+from instantly loosening rules without a redeploy.
+
+**Blend lending integration & JIT liquidity (#48).** Idle USDC can be supplied to a
+configured Blend pool (`set_yield_venue`, `allocate_to_yield`, `recall_from_yield`) up to
+`max_allocation` while preserving at least `max_daily` in liquid collateral. Spending entrypoints
+(`agent_buy`, `agent_create_market`) use Just-In-Time liquidity (`ensure_liquid`): shortfalls in
+liquid reserves trigger an atomic withdrawal from Blend within the same transaction. If pool
+utilization prevents withdrawal, the trade reverts cleanly (`YieldWithdrawFailed`, fail-closed).
+NAV views (`available_capital`) account for liquid plus supplied capital, alongside `capital_breakdown`.
+See [ADR 0006](adr/0006-blend-integration.md).
+
 The nested-authorization pitfall this design implies, and how it's handled,
 is documented at length in `contracts/treasury/src/lib.rs` (see
 `authorize_token_pull`) and exercised by

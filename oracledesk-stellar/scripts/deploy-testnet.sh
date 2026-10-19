@@ -32,6 +32,15 @@ MAX_DAILY=${MAX_DAILY:-10000000000}  # 1,000 USDC
 # Cap on capital deployed in open positions across all markets at once
 # (must be >= MAX_TRADE).
 MAX_NET_EXPOSURE=${MAX_NET_EXPOSURE:-$MAX_DAILY}
+# Drawdown risk controls (Issue #46)
+MAX_DRAWDOWN=${MAX_DRAWDOWN:-50000000000} # 5,000 USDC
+DRAWDOWN_WINDOW_DAYS=${DRAWDOWN_WINDOW_DAYS:-7}
+# Market creation risk controls (Issue #47)
+MAX_SEED=${MAX_SEED:-$MAX_MARKET}
+MAX_MARKETS_PER_DAY=${MAX_MARKETS_PER_DAY:-20}
+MIN_CLOSE_HORIZON=${MIN_CLOSE_HORIZON:-60}
+MAX_CLOSE_HORIZON=${MAX_CLOSE_HORIZON:-7776000} # 90 days
+ALLOWED_CATEGORIES=${ALLOWED_CATEGORIES:-63}     # 0x3F (Crypto, Forex, Equities, Commodities, Macro, Politics)
 # Timelock (seconds, >= 86400) on every loosening treasury change: raising a
 # cap, adding or widening an agent, switching market-core or collateral.
 CONFIG_DELAY=${CONFIG_DELAY:-86400}
@@ -168,6 +177,14 @@ fi
 TREASURY=$(json_get .contracts.treasury)
 if [ -z "$TREASURY" ]; then
   log "deploying treasury"
+  CREATION_POLICY=$(jq -nc \
+    --argjson max_seed "$MAX_SEED" \
+    --argjson max_markets "$MAX_MARKETS_PER_DAY" \
+    --argjson window_secs 86400 \
+    --argjson min_h "$MIN_CLOSE_HORIZON" \
+    --argjson max_h "$MAX_CLOSE_HORIZON" \
+    --argjson cats "$ALLOWED_CATEGORIES" \
+    '{"max_seed": $max_seed, "max_markets_per_window": $max_markets, "creation_window_secs": $window_secs, "min_close_horizon": $min_h, "max_close_horizon": $max_h, "allowed_categories": $cats}')
   TREASURY=$(stellar contract deploy \
     --wasm "$WASM_DIR/treasury.wasm" \
     --source-account "$DEPLOYER_KEY" \
@@ -181,7 +198,10 @@ if [ -z "$TREASURY" ]; then
     --max_market "$MAX_MARKET" \
     --max_daily "$MAX_DAILY" \
     --max_net_exposure "$MAX_NET_EXPOSURE" \
-    --config_delay "$CONFIG_DELAY")
+    --config_delay "$CONFIG_DELAY" \
+    --max_drawdown "$MAX_DRAWDOWN" \
+    --window_days "$DRAWDOWN_WINDOW_DAYS" \
+    --creation_policy "$CREATION_POLICY")
   json_set --arg id "$TREASURY" '.contracts.treasury = $id'
   json_set '.needs_treasury_wiring = true'
 else

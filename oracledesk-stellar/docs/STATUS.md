@@ -42,8 +42,16 @@ Key additions:
   and `guardian_void_market` with `GuardianReason`.
 - Spec-hash CLI: Added `committee` and `hybrid` spec hashing commands.
 - Reasoning registry wasm vendored into `contracts/resolver/reasoning_registry.wasm`
-  for cross-contract client generation in Soroban.
-- Documentation, architecture, ADRs, and security policy updated accordingly.
+## Contributor addendum: 2026-10-19
+
+Permissionless treasury settlement (#45), realized PnL tracking and auto-pause on drawdown (#46),
+market-creation risk controls (#47), and Blend lending integration with JIT liquidity (#48)
+are implemented on `feat/issues-45-46-47-48`.
+Key additions:
+- **Permissionless settlement (#45)**: `settle_market(caller, market_id)` allows anyone to settle resolved markets, recovering positions and LP remainders without hot agent keys. Graceful error handling for `market_core` errors (`NothingToRedeem`, `AlreadyClaimed`, `NotFinal`). Emits `MarketSettled`.
+- **Realized PnL & Drawdown Guard (#46)**: Full ledger tracking of cost and proceeds (`MarketPnl`), daily rolling window (`window_pnl`), and automatic `DrawdownPause` when losses exceed `max_drawdown`. Protects open positions by allowing reduce-only `agent_sell` in drawdown mode. Requires admin acknowledgement to resume.
+- **Creation Policy (#47)**: `CreationPolicy` bounding `max_seed` independently of `max_trade`, rolling window creation rate limits, horizon constraints (`min_close_horizon`, `max_close_horizon`), and allowed categories bitmask. Tighten-only admin configuration updates.
+- **Blend Lending & JIT Liquidity (#48)**: Idle capital deployment to Blend pool, atomic shortfall withdrawal in `agent_buy` and `agent_create_market` via `ensure_liquid`, fail-closed error handling with `YieldWithdrawFailed`, and comprehensive capital views (`available_capital`, `liquid_capital`, `capital_breakdown`). Documented in `docs/adr/0006-blend-integration.md`.
 
 ## Phase 0: recon and safety
 
