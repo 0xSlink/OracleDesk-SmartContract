@@ -35,6 +35,13 @@ Traces published via reasoning registry now validate market references and actio
 - `ProposeMarket` requires `NO_MARKET` (`u64::MAX`) sentinel for proposals made before market creation.
 - Vendored `contracts/reasoning-registry/market_core.wasm` via `contractimport!` to support cross-contract calls without cyclic cargo dependencies.
 
+### Merkle-Batched Trace Anchoring (#54)
+
+High-frequency decision anchoring via Merkle roots:
+- `publish_trace_batch`, `get_batch`, `batch_count`, `agent_batch_count`, `agent_batch_at`, `verify_trace_inclusion`, `compute_merkle_root`.
+- Strict domain separation (0x00 leaf prefix, 0x01 node prefix), odd node promotion without hashing, capped at 4096 leaves (max proof length 12).
+- Golden test vectors in `docs/vectors/merkle-v1.json` verified across Rust contract, TypeScript agents, and x402 verifier.
+
 ### Merge follow-up: 2026-10-17
 
 The work above landed on `develop` as merge commit `581a3ec` (PR #153,

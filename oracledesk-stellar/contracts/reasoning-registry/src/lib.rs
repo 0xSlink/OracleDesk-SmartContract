@@ -14,6 +14,22 @@ mod market_core {
 /// `agents/core/trace.ts` byte-for-byte: `sha256(TAG || trace_hash || salt)`.
 pub const COMMIT_DOMAIN_TAG: &[u8] = b"oracledesk.trace.commit.v1";
 
+/// Merkle tree constants for batch anchoring (#54).
+pub const MAX_LEAVES: u32 = 4096;
+pub const MAX_PROOF_LEN: u32 = 12;
+pub const MERKLE_LEAF_PREFIX: u8 = 0x00;
+pub const MERKLE_NODE_PREFIX: u8 = 0x01;
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TraceBatch {
+    pub agent: Address,
+    pub root: BytesN<32>,
+    pub leaf_count: u32,
+    pub manifest_cid: String,
+    pub published_at: u64,
+}
+
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
@@ -108,6 +124,14 @@ pub enum DataKey {
     FlagHistory(u64, u32),
     /// Address of market-core contract (#55).
     MarketCore,
+    /// Merkle trace batch: batch_id -> TraceBatch (#54).
+    Batch(u64),
+    /// Next batch ID (#54).
+    NextBatchId,
+    /// Number of batches anchored by agent (#54).
+    AgentBatchCount(Address),
+    /// Agent batch index: (agent, index) -> batch_id (#54).
+    AgentBatch(Address, u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -161,6 +185,12 @@ pub enum Error {
     ProposalMustUseNoMarket = 17,
     /// Other(Symbol) shadows a canonical TraceAction name (#55).
     UseCanonicalAction = 18,
+    /// Batch does not exist (#54).
+    BatchNotFound = 19,
+    /// Batch parameters are invalid (leaf_count out of bounds or empty manifest) (#54).
+    InvalidBatch = 20,
+    /// Inclusion proof is invalid or malformed (#54).
+    InvalidProof = 21,
 }
 
 #[contractevent]
@@ -259,6 +289,19 @@ pub struct TracePublished {
     pub published_at: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BatchPublished {
+    #[topic]
+    pub batch_id: u64,
+    #[topic]
+    pub agent: Address,
+    pub root: BytesN<32>,
+    pub leaf_count: u32,
+    pub manifest_cid: String,
+    pub published_at: u64,
+}
+
 #[contract]
 pub struct ReasoningRegistry;
 
@@ -268,6 +311,7 @@ impl ReasoningRegistry {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::MarketCore, &market_core);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+        env.storage().instance().set(&DataKey::NextBatchId, &0u64);
     }
 
     pub fn register_agent(env: Env, agent: Address) -> Result<(), Error> {
@@ -644,6 +688,164 @@ impl ReasoningRegistry {
             .persistent()
             .get(&DataKey::MarketTrace(market_id, index))
             .ok_or(Error::TraceNotFound)
+    }
+
+    /// Anchors a Merkle batch of N traces off-chain, storing only the 32-byte root
+    /// and manifest CID on-chain (#54).
+    pub fn publish_trace_batch(
+        env: Env,
+        agent: Address,
+        root: BytesN<32>,
+        leaf_count: u32,
+        manifest_cid: String,
+    ) -> Result<u64, Error> {
+        agent.require_auth();
+        let record = Self::load_agent(&env, &agent).ok_or(Error::AgentNotRegistered)?;
+        if !matches!(record.status, AgentStatus::Active) {
+            return Err(Error::AgentNotActive);
+        }
+        if leaf_count == 0 || leaf_count > MAX_LEAVES || manifest_cid.is_empty() {
+            return Err(Error::InvalidBatch);
+        }
+
+        let batch_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::NextBatchId)
+            .ok_or(Error::NotInitialized)?;
+        env.storage().instance().set(&DataKey::NextBatchId, &(batch_id + 1));
+
+        let batch = TraceBatch {
+            agent: agent.clone(),
+            root: root.clone(),
+            leaf_count,
+            manifest_cid: manifest_cid.clone(),
+            published_at: env.ledger().timestamp(),
+        };
+        Self::put(&env, &DataKey::Batch(batch_id), &batch);
+
+        let agent_count_key = DataKey::AgentBatchCount(agent.clone());
+        let agent_idx: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
+        Self::put(&env, &DataKey::AgentBatch(agent.clone(), agent_idx), &batch_id);
+        Self::put(&env, &agent_count_key, &(agent_idx + 1));
+
+        BatchPublished {
+            batch_id,
+            agent,
+            root,
+            leaf_count,
+            manifest_cid,
+            published_at: batch.published_at,
+        }
+        .publish(&env);
+
+        Ok(batch_id)
+    }
+
+    pub fn get_batch(env: Env, batch_id: u64) -> Result<TraceBatch, Error> {
+        let key = DataKey::Batch(batch_id);
+        let batch: TraceBatch = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::BatchNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(batch)
+    }
+
+    pub fn batch_count(env: Env) -> u64 {
+        env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(0)
+    }
+
+    pub fn agent_batch_count(env: Env, agent: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentBatchCount(agent))
+            .unwrap_or(0)
+    }
+
+    pub fn agent_batch_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
+        let key = DataKey::AgentBatch(agent, index);
+        let id: u64 = env
+            .storage()
+            .persistent()
+            .get(&key)
+            .ok_or(Error::BatchNotFound)?;
+        env.storage()
+            .persistent()
+            .extend_ttl(&key, BUMP_THRESHOLD, BUMP_TO);
+        Ok(id)
+    }
+
+    pub fn verify_trace_inclusion(
+        env: Env,
+        batch_id: u64,
+        trace_hash: BytesN<32>,
+        index: u32,
+        proof: Vec<BytesN<32>>,
+    ) -> Result<bool, Error> {
+        let batch = Self::get_batch(env.clone(), batch_id)?;
+        if index >= batch.leaf_count {
+            return Ok(false);
+        }
+        if proof.len() > MAX_PROOF_LEN {
+            return Err(Error::InvalidProof);
+        }
+        match Self::compute_merkle_root(&env, batch.leaf_count, &trace_hash, index, &proof) {
+            Ok(computed) => Ok(computed == batch.root),
+            Err(Error::InvalidProof) => Ok(false),
+            Err(e) => Err(e),
+        }
+    }
+
+    pub fn compute_merkle_root(
+        env: &Env,
+        leaf_count: u32,
+        trace_hash: &BytesN<32>,
+        index: u32,
+        proof: &Vec<BytesN<32>>,
+    ) -> Result<BytesN<32>, Error> {
+        let mut leaf_preimage = Bytes::new(env);
+        leaf_preimage.push_back(MERKLE_LEAF_PREFIX);
+        leaf_preimage.append(&trace_hash.clone().into());
+        let mut current: BytesN<32> = env.crypto().sha256(&leaf_preimage).into();
+
+        let mut curr_idx = index;
+        let mut curr_len = leaf_count;
+        let mut proof_idx: u32 = 0;
+
+        while curr_len > 1 {
+            if curr_len % 2 == 1 && curr_idx == curr_len - 1 {
+                // Odd last node promoted unchanged: no sibling in proof
+            } else {
+                if proof_idx >= proof.len() {
+                    return Err(Error::InvalidProof);
+                }
+                let sibling = proof.get(proof_idx).unwrap();
+                proof_idx += 1;
+
+                let mut node_preimage = Bytes::new(env);
+                node_preimage.push_back(MERKLE_NODE_PREFIX);
+                if curr_idx % 2 == 0 {
+                    node_preimage.append(&current.clone().into());
+                    node_preimage.append(&sibling.into());
+                } else {
+                    node_preimage.append(&sibling.into());
+                    node_preimage.append(&current.clone().into());
+                }
+                current = env.crypto().sha256(&node_preimage).into();
+            }
+            curr_idx /= 2;
+            curr_len = (curr_len + 1) / 2;
+        }
+
+        if proof_idx != proof.len() {
+            return Err(Error::InvalidProof);
+        }
+
+        Ok(current)
     }
 }
 
@@ -1861,5 +2063,257 @@ mod test {
         let (_market_core_id, market_core_client) = register_market_core(&env, &admin);
         let count = market_core_client.market_count();
         assert_eq!(count, 50);
+    }
+
+    // ── #54 Merkle-batched trace anchoring ──────────────────────────────
+
+    #[test]
+    fn merkle_vector_sizes_match_spec() {
+        let (env, client, _, _) = setup();
+
+        // Size 1: leaf 0
+        let trace_0 = BytesN::from_array(
+            &env,
+            &[
+                0x63, 0x6e, 0xef, 0xad, 0x93, 0xfd, 0xbc, 0x03, 0xa2, 0x58, 0x52, 0x2c, 0x63, 0x67,
+                0x2a, 0xf9, 0x1a, 0x5f, 0x67, 0x62, 0x4e, 0x9b, 0xc9, 0x31, 0xbe, 0xe4, 0xf4, 0x37,
+                0x4e, 0x1f, 0xab, 0x58,
+            ],
+        );
+        let root_1 = BytesN::from_array(
+            &env,
+            &[
+                0xd2, 0xea, 0x33, 0x68, 0xe7, 0x8c, 0x8f, 0xf7, 0x63, 0xb5, 0x92, 0x3a, 0x59, 0xf8,
+                0xaf, 0x10, 0x1d, 0xda, 0x4c, 0x3b, 0xff, 0x46, 0xae, 0x74, 0xe1, 0xe9, 0xa5, 0x2c,
+                0x77, 0x55, 0xaa, 0xeb,
+            ],
+        );
+        let proof_1: Vec<BytesN<32>> = Vec::new(&env);
+        let computed_1 = client.compute_merkle_root(&1, &trace_0, &0, &proof_1);
+        assert_eq!(computed_1, root_1);
+
+        // Size 2: leaf 0 with leaf 1 sibling
+        let root_2 = BytesN::from_array(
+            &env,
+            &[
+                0xcd, 0x3a, 0x97, 0xb9, 0x45, 0x78, 0x20, 0x45, 0x0f, 0xf6, 0xd5, 0x77, 0xb6, 0xdd,
+                0x8a, 0x13, 0xbe, 0xf9, 0x4a, 0xce, 0x08, 0xb8, 0xec, 0xba, 0xbe, 0x4e, 0x2c, 0xa4,
+                0x74, 0x71, 0xe2, 0x29,
+            ],
+        );
+        let sibling_1 = BytesN::from_array(
+            &env,
+            &[
+                0x17, 0x82, 0x46, 0xc1, 0x01, 0xf8, 0x2f, 0xba, 0x9b, 0x1b, 0xb6, 0x30, 0x3f, 0x1e,
+                0x9f, 0x13, 0x12, 0x04, 0x26, 0x55, 0x65, 0x76, 0xc5, 0xeb, 0xc7, 0x8c, 0x42, 0xd7,
+                0x6a, 0x73, 0x48, 0xb3,
+            ],
+        );
+        let mut proof_2: Vec<BytesN<32>> = Vec::new(&env);
+        proof_2.push_back(sibling_1);
+        let computed_2 = client.compute_merkle_root(&2, &trace_0, &0, &proof_2);
+        assert_eq!(computed_2, root_2);
+
+        // Size 3: leaf 2 (odd node promoted to level 1, then paired with root_2)
+        let trace_2 = BytesN::from_array(
+            &env,
+            &[
+                0x42, 0x4d, 0xa8, 0xb6, 0x08, 0x8f, 0xd9, 0xf1, 0xc2, 0xd0, 0xd1, 0x1c, 0x5a, 0x6c,
+                0xd5, 0xd6, 0x1b, 0xf5, 0x31, 0x6d, 0xee, 0x8e, 0x61, 0xb3, 0xb0, 0xa3, 0x0f, 0x2a,
+                0x01, 0xb8, 0xb4, 0xa1,
+            ],
+        );
+        let root_3 = BytesN::from_array(
+            &env,
+            &[
+                0xa5, 0xb9, 0x47, 0x06, 0xba, 0xa6, 0x8c, 0x77, 0x8b, 0x70, 0x11, 0xab, 0x43, 0xea,
+                0x96, 0x29, 0x31, 0xbe, 0x6d, 0xfc, 0x2e, 0xef, 0x99, 0x57, 0xb5, 0x53, 0x68, 0x9b,
+                0x49, 0xf8, 0xdc, 0x91,
+            ],
+        );
+        let mut proof_3: Vec<BytesN<32>> = Vec::new(&env);
+        proof_3.push_back(root_2.clone());
+        let computed_3 = client.compute_merkle_root(&3, &trace_2, &2, &proof_3);
+        assert_eq!(computed_3, root_3);
+    }
+
+    #[test]
+    fn publish_batch_and_verify_inclusion() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+
+        let root = BytesN::from_array(
+            &env,
+            &[
+                0xa5, 0xb9, 0x47, 0x06, 0xba, 0xa6, 0x8c, 0x77, 0x8b, 0x70, 0x11, 0xab, 0x43, 0xea,
+                0x96, 0x29, 0x31, 0xbe, 0x6d, 0xfc, 0x2e, 0xef, 0x99, 0x57, 0xb5, 0x53, 0x68, 0x9b,
+                0x49, 0xf8, 0xdc, 0x91,
+            ],
+        );
+        let batch_id = client.publish_trace_batch(
+            &agent,
+            &root,
+            &3,
+            &String::from_str(&env, "ipfs://manifest-3"),
+        );
+        assert_eq!(batch_id, 0);
+        assert_eq!(client.batch_count(), 1);
+        assert_eq!(client.agent_batch_count(&agent), 1);
+        assert_eq!(client.agent_batch_at(&agent, &0), 0);
+
+        let batch = client.get_batch(&batch_id);
+        assert_eq!(batch.agent, agent);
+        assert_eq!(batch.root, root);
+        assert_eq!(batch.leaf_count, 3);
+        assert_eq!(batch.manifest_cid, String::from_str(&env, "ipfs://manifest-3"));
+
+        let trace_2 = BytesN::from_array(
+            &env,
+            &[
+                0x42, 0x4d, 0xa8, 0xb6, 0x08, 0x8f, 0xd9, 0xf1, 0xc2, 0xd0, 0xd1, 0x1c, 0x5a, 0x6c,
+                0xd5, 0xd6, 0x1b, 0xf5, 0x31, 0x6d, 0xee, 0x8e, 0x61, 0xb3, 0xb0, 0xa3, 0x0f, 0x2a,
+                0x01, 0xb8, 0xb4, 0xa1,
+            ],
+        );
+        let sibling_root_2 = BytesN::from_array(
+            &env,
+            &[
+                0xcd, 0x3a, 0x97, 0xb9, 0x45, 0x78, 0x20, 0x45, 0x0f, 0xf6, 0xd5, 0x77, 0xb6, 0xdd,
+                0x8a, 0x13, 0xbe, 0xf9, 0x4a, 0xce, 0x08, 0xb8, 0xec, 0xba, 0xbe, 0x4e, 0x2c, 0xa4,
+                0x74, 0x71, 0xe2, 0x29,
+            ],
+        );
+        let mut proof: Vec<BytesN<32>> = Vec::new(&env);
+        proof.push_back(sibling_root_2);
+
+        // Valid inclusion check returns true
+        assert!(client.verify_trace_inclusion(&batch_id, &trace_2, &2, &proof));
+
+        // Wrong trace hash returns false
+        let fake_trace = BytesN::from_array(&env, &[99u8; 32]);
+        assert!(!client.verify_trace_inclusion(&batch_id, &fake_trace, &2, &proof));
+
+        // Index out of bounds (index 3 with leaf_count 3) returns false
+        assert!(!client.verify_trace_inclusion(&batch_id, &trace_2, &3, &proof));
+
+        // Mutated proof element returns false
+        let mut bad_proof: Vec<BytesN<32>> = Vec::new(&env);
+        bad_proof.push_back(BytesN::from_array(&env, &[0u8; 32]));
+        assert!(!client.verify_trace_inclusion(&batch_id, &trace_2, &2, &bad_proof));
+    }
+
+    #[test]
+    fn merkle_second_preimage_resistance() {
+        let env = Env::default();
+        let trace = BytesN::from_array(&env, &[1u8; 32]);
+        // Leaf hash is sha256(0x00 || trace)
+        let mut leaf_preimage = Bytes::new(&env);
+        leaf_preimage.push_back(MERKLE_LEAF_PREFIX);
+        leaf_preimage.append(&trace.clone().into());
+        let leaf_hash: BytesN<32> = env.crypto().sha256(&leaf_preimage).into();
+
+        // Node hash is sha256(0x01 || left || right)
+        let mut node_preimage = Bytes::new(&env);
+        node_preimage.push_back(MERKLE_NODE_PREFIX);
+        node_preimage.append(&trace.clone().into());
+        node_preimage.append(&trace.into());
+        let node_hash: BytesN<32> = env.crypto().sha256(&node_preimage).into();
+
+        assert_ne!(leaf_hash, node_hash);
+    }
+
+    #[test]
+    fn merkle_proof_length_bounded() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let root = BytesN::from_array(&env, &[1u8; 32]);
+        let batch_id = client.publish_trace_batch(
+            &agent,
+            &root,
+            &100,
+            &String::from_str(&env, "ipfs://manifest"),
+        );
+
+        // Proof of length 13 (> MAX_PROOF_LEN = 12) must fail with InvalidProof
+        let mut long_proof: Vec<BytesN<32>> = Vec::new(&env);
+        for _ in 0..13 {
+            long_proof.push_back(BytesN::from_array(&env, &[2u8; 32]));
+        }
+        assert_eq!(
+            client.try_verify_trace_inclusion(&batch_id, &BytesN::from_array(&env, &[3u8; 32]), &0, &long_proof),
+            Err(Ok(Error::InvalidProof))
+        );
+    }
+
+    #[test]
+    fn merkle_batch_size_bounded() {
+        let (env, client, _, agent) = setup();
+        client.register_agent(&agent);
+        let root = BytesN::from_array(&env, &[1u8; 32]);
+
+        // leaf_count = 0 fails
+        assert_eq!(
+            client.try_publish_trace_batch(
+                &agent,
+                &root,
+                &0,
+                &String::from_str(&env, "ipfs://manifest"),
+            ),
+            Err(Ok(Error::InvalidBatch))
+        );
+
+        // leaf_count = 4097 (> MAX_LEAVES = 4096) fails
+        assert_eq!(
+            client.try_publish_trace_batch(
+                &agent,
+                &root,
+                &4097,
+                &String::from_str(&env, "ipfs://manifest"),
+            ),
+            Err(Ok(Error::InvalidBatch))
+        );
+
+        // empty manifest_cid fails
+        assert_eq!(
+            client.try_publish_trace_batch(
+                &agent,
+                &root,
+                &10,
+                &String::from_str(&env, ""),
+            ),
+            Err(Ok(Error::InvalidBatch))
+        );
+    }
+
+    #[test]
+    fn unregistered_or_retired_agent_cannot_publish_batch() {
+        let (env, client, _, agent) = setup();
+        let root = BytesN::from_array(&env, &[1u8; 32]);
+
+        // Unregistered agent fails
+        assert_eq!(
+            client.try_publish_trace_batch(
+                &agent,
+                &root,
+                &5,
+                &String::from_str(&env, "ipfs://manifest"),
+            ),
+            Err(Ok(Error::AgentNotRegistered))
+        );
+
+        // Register then retire
+        client.register_agent(&agent);
+        client.retire_agent(&agent);
+
+        // Retired agent fails
+        assert_eq!(
+            client.try_publish_trace_batch(
+                &agent,
+                &root,
+                &5,
+                &String::from_str(&env, "ipfs://manifest"),
+            ),
+            Err(Ok(Error::AgentNotActive))
+        );
     }
 }

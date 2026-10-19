@@ -1,7 +1,13 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
 import { createHash } from "node:crypto";
-import { ipfsUrl, verifyChain, verifyTraceHash, type ChainEntry } from "./trace-verification.js";
+import {
+  ipfsUrl,
+  verifyBatchInclusion,
+  verifyChain,
+  verifyTraceHash,
+  type ChainEntry,
+} from "./trace-verification.js";
 
 test("verifies the exact bytes received from IPFS", () => {
   const content = new TextEncoder().encode('{"action":"buy","confidence":0.72}');
@@ -60,4 +66,18 @@ test("verifyChain detects a bad genesis", () => {
   const forged = chain(2);
   forged[0] = { ...forged[0], prevTraceHash: h(7) };
   assert.deepEqual(verifyChain(forged, true), { ok: false, reason: "bad-genesis", atSeq: 1n });
+});
+
+// ─── Merkle batch inclusion (#54) ──────────────────────────────────────────
+
+test("verifyBatchInclusion verifies against golden vector", () => {
+  // Vector size 2: root cd3a97b9457820450ff6d577b6dd8a13bef94ace08b8ecbabe4e2ca47471e229
+  const root = "cd3a97b9457820450ff6d577b6dd8a13bef94ace08b8ecbabe4e2ca47471e229";
+  const trace0 = "636eefad93fdbc03a258522c63672af91a5f67624e9bc931bee4f4374e1fab58";
+  const sibling1 = "178246c101f82fba9b1bb6303f1e9f13120426556576c5ebc78c42d76a7348b3";
+
+  assert.equal(verifyBatchInclusion(root, 2, trace0, 0, [sibling1]), true);
+  assert.equal(verifyBatchInclusion(root, 2, trace0, 1, [sibling1]), false);
+  assert.equal(verifyBatchInclusion(root, 2, "00".repeat(32), 0, [sibling1]), false);
+  assert.equal(verifyBatchInclusion(root, 2, trace0, 0, ["00".repeat(32)]), false);
 });

@@ -28,6 +28,66 @@ export function ipfsUrl(gateway: string, cid: string): string {
   return `${base}/${encodeURIComponent(cid)}`;
 }
 
+// ─── Merkle batch inclusion (#54) ──────────────────────────────────────────
+
+export const MAX_BATCH_LEAVES = 4096;
+export const MAX_BATCH_PROOF_LEN = 12;
+
+export function hashMerkleLeaf(traceHashHex: string): string {
+  const norm = traceHashHex.toLowerCase().replace(/^0x/, "");
+  return createHash("sha256")
+    .update(Buffer.from([0x00]))
+    .update(Buffer.from(norm, "hex"))
+    .digest("hex");
+}
+
+export function hashMerkleNode(leftHex: string, rightHex: string): string {
+  const left = leftHex.toLowerCase().replace(/^0x/, "");
+  const right = rightHex.toLowerCase().replace(/^0x/, "");
+  return createHash("sha256")
+    .update(Buffer.from([0x01]))
+    .update(Buffer.from(left, "hex"))
+    .update(Buffer.from(right, "hex"))
+    .digest("hex");
+}
+
+export function verifyBatchInclusion(
+  rootHex: string,
+  leafCount: number,
+  traceHashHex: string,
+  index: number,
+  proofHex: string[],
+): boolean {
+  if (leafCount <= 0 || leafCount > MAX_BATCH_LEAVES) return false;
+  if (index < 0 || index >= leafCount) return false;
+  if (proofHex.length > MAX_BATCH_PROOF_LEN) return false;
+
+  let current = hashMerkleLeaf(traceHashHex);
+  let currIdx = index;
+  let currLen = leafCount;
+  let proofIdx = 0;
+
+  while (currLen > 1) {
+    if (currLen % 2 === 1 && currIdx === currLen - 1) {
+      // Lone odd node promoted without sibling
+    } else {
+      if (proofIdx >= proofHex.length) return false;
+      const sibling = proofHex[proofIdx++];
+      if (currIdx % 2 === 0) {
+        current = hashMerkleNode(current, sibling);
+      } else {
+        current = hashMerkleNode(sibling, current);
+      }
+    }
+
+    currIdx = Math.floor(currIdx / 2);
+    currLen = Math.floor((currLen + 1) / 2);
+  }
+
+  const normRoot = rootHex.toLowerCase().replace(/^0x/, "");
+  return proofIdx === proofHex.length && current.toLowerCase() === normRoot;
+}
+
 // ─── Hash-chained traces (#52) ───────────────────────────────────────────────
 
 /** One link of an agent's on-chain trace log, as read from the registry. */

@@ -179,3 +179,27 @@ test("dry-run publishTrace passes u64::MAX sentinel exactly", async () => {
     assert.deepEqual((result.args as any).action, { tag: "ProposeMarket", values: undefined });
   }
 });
+
+test("dry-run publishTraceBatch describes batch anchoring without network", async () => {
+  const adapter = new StellarAdapter({
+    mode: "dry-run",
+    networkPassphrase: "Test SDF Network ; September 2015",
+    rpcUrl: "https://soroban-testnet.stellar.org",
+    deployments,
+  });
+  const root = Buffer.alloc(32, 2);
+  const result = await adapter.publishTraceBatch({
+    agent: "GAGENT",
+    root,
+    leaf_count: 50,
+    manifest_cid: "ipfs://batch-manifest-50",
+  });
+  assert.equal(result.dryRun, true);
+  if (result.dryRun) {
+    assert.equal(result.contractId, "CREGISTRY");
+    assert.equal(result.method, "publish_trace_batch");
+    assert.deepEqual((result.args as any).root, root);
+    assert.equal((result.args as any).leaf_count, 50);
+    assert.equal((result.args as any).manifest_cid, "ipfs://batch-manifest-50");
+  }
+});

@@ -51,7 +51,18 @@ export const Errors = {
   15: {message:"UnknownMarket"},
   16: {message:"MarketRequired"},
   17: {message:"ProposalMustUseNoMarket"},
-  18: {message:"UseCanonicalAction"}
+  18: {message:"UseCanonicalAction"},
+  19: {message:"BatchNotFound"},
+  20: {message:"InvalidBatch"},
+  21: {message:"InvalidProof"}
+}
+
+export interface TraceBatch {
+  agent: string;
+  leaf_count: u32;
+  manifest_cid: string;
+  published_at: u64;
+  root: Buffer;
 }
 
 export type TraceAction =
@@ -106,13 +117,24 @@ export type DataKey =
   | {tag: "Flag", values: readonly [u64]}
   | {tag: "FlagHistoryCount", values: readonly [u64]}
   | {tag: "FlagHistory", values: readonly [u64, u32]}
-  | {tag: "MarketCore", values: void};
+  | {tag: "MarketCore", values: void}
+  | {tag: "Batch", values: readonly [u64]}
+  | {tag: "NextBatchId", values: void}
+  | {tag: "AgentBatchCount", values: readonly [string]}
+  | {tag: "AgentBatch", values: readonly [string, u64]};
 
 export interface Client {
   get_trace: ({trace_id}: {trace_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Trace>>>
   trace_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
   verify_trace: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
   trace_verdict: ({trace_id, received_hash}: {trace_id: u64, received_hash: Buffer}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TraceVerdict>>>
+  publish_trace_batch: ({agent, root, leaf_count, manifest_cid}: {agent: string, root: Buffer, leaf_count: u32, manifest_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  get_batch: ({batch_id}: {batch_id: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<TraceBatch>>>
+  batch_count: (options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+  agent_batch_count: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<u64>>
+  agent_batch_at: ({agent, index}: {agent: string, index: u64}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
+  verify_trace_inclusion: ({batch_id, trace_hash, index, proof}: {batch_id: u64, trace_hash: Buffer, index: u32, proof: Array<Buffer>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<boolean>>>
+  compute_merkle_root: ({leaf_count, trace_hash, index, proof}: {leaf_count: u32, trace_hash: Buffer, index: u32, proof: Array<Buffer>}, options?: MethodOptions) => Promise<AssembledTransaction<Result<Buffer>>>
   is_registered: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<boolean>>
   get_agent: ({agent}: {agent: string}, options?: MethodOptions) => Promise<AssembledTransaction<Option<AgentRecord>>>
   publish_trace: ({agent, market_id, action, trace_hash, ipfs_cid}: {agent: string, market_id: u64, action: TraceAction, trace_hash: Buffer, ipfs_cid: string}, options?: MethodOptions) => Promise<AssembledTransaction<Result<u64>>>
@@ -171,6 +193,13 @@ export class Client extends ContractClient {
     trace_count: this.txFromJSON<u64>,
     verify_trace: this.txFromJSON<Result<boolean>>,
     trace_verdict: this.txFromJSON<Result<TraceVerdict>>,
+    publish_trace_batch: this.txFromJSON<Result<u64>>,
+    get_batch: this.txFromJSON<Result<TraceBatch>>,
+    batch_count: this.txFromJSON<u64>,
+    agent_batch_count: this.txFromJSON<u64>,
+    agent_batch_at: this.txFromJSON<Result<u64>>,
+    verify_trace_inclusion: this.txFromJSON<Result<boolean>>,
+    compute_merkle_root: this.txFromJSON<Result<Buffer>>,
     is_registered: this.txFromJSON<boolean>,
     get_agent: this.txFromJSON<Option<AgentRecord>>,
     publish_trace: this.txFromJSON<Result<u64>>,

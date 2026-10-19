@@ -269,4 +269,19 @@ export class StellarAdapter {
       (client) => client.publish_trace(call),
     );
   }
+
+  async publishTraceBatch(args: {
+    agent: string;
+    root: Buffer;
+    leaf_count: number;
+    manifest_cid: string;
+  }): Promise<AdapterResult<bigint>> {
+    return this.run(
+      "reasoning_registry",
+      "@oracledesk/bindings-reasoning-registry",
+      "publish_trace_batch",
+      args,
+      (client) => client.publish_trace_batch(args),
+    );
+  }
 }
