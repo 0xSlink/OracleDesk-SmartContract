@@ -131,7 +131,7 @@ jobs:
 
       - name: Install and build bindings packages
         run: |
-          for pkg in market-core resolver treasury reasoning-registry; do
+          for pkg in market-core resolver treasury reasoning-registry timelock router; do
             (cd "packages/bindings/$pkg" && npm install && npm run build)
           done
 

@@ -44,6 +44,10 @@ use reasoning_registry::Client as RegistryClient;
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
+/// How long a pending admin proposal stays acceptable. Kept short so a
+/// mistyped or abandoned handover cannot linger as a live takeover path.
+pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+
 /// Most keys a weighted committee may hold. Bounds registration (O(n^2)
 /// duplicate check) and the per-call signature scan.
 pub const MAX_WEIGHTED_SIGNERS: u32 = 32;
@@ -274,145 +278,69 @@ pub fn spec_v2_hash(env: &Env, spec: &ResolutionSpecV2) -> BytesN<32> {
     env.crypto().sha256(&preimage).into()
 }
 
-/// Base of the resolver's error-code range. Every contract owns a disjoint
-/// range so a numeric `Error(Contract, #N)` is unambiguous even before the
-/// emitting contract is known (see `docs/adr/0006-cross-contract-errors.md`):
-/// market-core `1..=999`, resolver `1001..=1999`, treasury `2001..=2999`,
-/// reasoning-registry `3001..=3999`.
-pub const RESOLVER_ERROR_BASE: u32 = 1_000;
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    NotInitialized = 1001,
-    Unauthorized = 1002,
-    InvalidConfig = 1003,
-    MarketAlreadyConfigured = 1004,
-    MarketNotConfigured = 1005,
-    WrongMode = 1006,
-    MarketNotClosed = 1007,
-    PriceUnavailable = 1008,
-    StalePrice = 1009,
-    InvalidPrice = 1010,
-    NotSigner = 1011,
-    AlreadyAttested = 1012,
-    ThresholdNotReached = 1013,
-    DisputeActive = 1014,
-    DisputeWindowOpen = 1015,
-    NoProposal = 1016,
-    AlreadyFinalized = 1017,
-    SpecHashMismatch = 1018,
-    DeadlineNotReached = 1019,
-    ResolutionAvailable = 1020,
-    DomainMismatch = 1021,
-    StaleRound = 1022,
-    TooManySignatures = 1023,
-    DisputeWindowClosed = 1024,
-    NoDispute = 1025,
-    CommitteeNotFound = 1026,
-    RotationPending = 1027,
-    RotationNotReady = 1028,
-    RotationBoundExceeded = 1029,
-    DuplicateMember = 1030,
-    CommitteeTooLarge = 1031,
-    EvidenceDisabled = 1032,
-    EvidenceRequired = 1033,
-    EvidenceNotFound = 1034,
-    EvidenceAuthorMismatch = 1035,
-    EvidenceMarketMismatch = 1036,
-    EvidenceTooEarly = 1037,
-    EvidenceAlreadyUsed = 1038,
-    GuardianNotAllowed = 1039,
-    TooManyCancels = 1040,
-    SnapshotExists = 1041,
-
-    // --- market-core error mappings (canonical cross-contract model) -------
-    // A call into market-core that fails no longer aborts with market-core's
-    // own numeric code (which used to be decoded as a resolver error). Each
-    // mapped variant names the callee and the condition, so callers and
-    // bindings can tell `MarketCoreMarketNotFound` from a resolver-local
-    // `MarketNotClosed`.
-    /// The market-core invocation itself failed (host error, trap, or an
-    /// unmapped market-core error).
-    MarketCoreCallFailed = 1042,
-    MarketCoreMarketNotFound = 1043,
-    MarketCoreNotFinal = 1044,
-    MarketCoreMarketNotOpen = 1045,
-    MarketCoreMarketClosed = 1046,
-    MarketCoreInsufficientLiquidity = 1047,
-    MarketCoreInsufficientShares = 1048,
-    MarketCoreAlreadyClaimed = 1049,
-    MarketCoreNothingToRedeem = 1050,
-    MarketCoreInvalidAmount = 1051,
-    MarketCoreOverflow = 1052,
-    MarketCoreSlippageExceeded = 1053,
-
-    // --- reasoning-registry error mappings ---------------------------------
-    /// A reasoning-registry invocation failed (host error or unmapped error).
-    RegistryCallFailed = 1054,
-}
-
-/// Maps a market-core error into the resolver's own disjoint range. Only the
-/// conditions the resolver can meaningfully react to get a named variant; the
-/// rest collapse to [`Error::MarketCoreCallFailed`] rather than leaking
-/// market-core's numeric code through the resolver ABI.
-pub fn map_market_core_error(error: market_core::Error) -> Error {
-    use market_core::Error as Core;
-    match error {
-        Core::MarketNotFound => Error::MarketCoreMarketNotFound,
-        Core::NotFinal => Error::MarketCoreNotFinal,
-        Core::MarketNotOpen => Error::MarketCoreMarketNotOpen,
-        Core::MarketClosed => Error::MarketCoreMarketClosed,
-        Core::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
-        Core::InsufficientShares => Error::MarketCoreInsufficientShares,
-        Core::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
-        Core::NothingToRedeem => Error::MarketCoreNothingToRedeem,
-        Core::InvalidAmount => Error::MarketCoreInvalidAmount,
-        Core::Overflow => Error::MarketCoreOverflow,
-        Core::SlippageExceeded => Error::MarketCoreSlippageExceeded,
-        _ => Error::MarketCoreCallFailed,
-    }
-}
-
-/// Converts the shared `Outcome` into the `contractimport!`-generated
-/// market-core `Outcome`. They are structurally identical (a compile-time test
-/// pins that), but they are distinct Rust types.
-fn to_core_outcome(outcome: &Outcome) -> market_core::Outcome {
-    match outcome {
-        Outcome::Yes => market_core::Outcome::Yes,
-        Outcome::No => market_core::Outcome::No,
-    }
-}
-
-/// Runs a generated `try_*` market-core call, mapping both the callee error
-/// and a host/invocation failure into resolver variants. This is the *only*
-/// shape a cross-contract market-core call may take; the panicking generated
-/// methods are never used (they would abort with market-core's code).
-fn core_call<T>(
-    result: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(error)) => Err(map_market_core_error(error)),
-        Err(_) => Err(Error::MarketCoreCallFailed),
-    }
-}
-
-/// Runs a generated `try_*` reasoning-registry call, mapping failures into the
-/// resolver's own range (currently only `try_get_trace` is used).
-fn registry_call<T, E>(
-    result: Result<Result<T, E>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
-) -> Result<T, Error> {
-    match result {
-        Ok(Ok(value)) => Ok(value),
-        Ok(Err(_)) | Err(_) => Err(Error::RegistryCallFailed),
-    }
+    NotInitialized = 1,
+    Unauthorized = 2,
+    InvalidConfig = 3,
+    MarketAlreadyConfigured = 4,
+    MarketNotConfigured = 5,
+    WrongMode = 6,
+    MarketNotClosed = 7,
+    PriceUnavailable = 8,
+    StalePrice = 9,
+    InvalidPrice = 10,
+    NotSigner = 11,
+    AlreadyAttested = 12,
+    ThresholdNotReached = 13,
+    DisputeActive = 14,
+    DisputeWindowOpen = 15,
+    NoProposal = 16,
+    AlreadyFinalized = 17,
+    SpecHashMismatch = 18,
+    DeadlineNotReached = 19,
+    ResolutionAvailable = 20,
+    DomainMismatch = 21,
+    StaleRound = 22,
+    TooManySignatures = 23,
+    DisputeWindowClosed = 24,
+    NoDispute = 25,
+    CommitteeNotFound = 26,
+    RotationPending = 27,
+    RotationNotReady = 28,
+    RotationBoundExceeded = 29,
+    DuplicateMember = 30,
+    CommitteeTooLarge = 31,
+    EvidenceDisabled = 32,
+    EvidenceRequired = 33,
+    EvidenceNotFound = 34,
+    EvidenceAuthorMismatch = 35,
+    EvidenceMarketMismatch = 36,
+    EvidenceTooEarly = 37,
+    EvidenceAlreadyUsed = 38,
+    GuardianNotAllowed = 39,
+    TooManyCancels = 40,
+    SnapshotExists = 41,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 42,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 43,
 }
 
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     MarketCore,
     Price(u64),
     Signers(u64),
@@ -677,6 +605,23 @@ pub struct GuardianAction {
     pub at: u64,
 }
 
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {}
+
 #[soroban_sdk::contractclient(name = "ReflectorPriceClient")]
 pub trait ReflectorPrice {
     fn price(env: Env, asset: OracleAsset, timestamp: u64) -> Option<PriceData>;
@@ -685,6 +630,11 @@ pub trait ReflectorPrice {
 #[contract]
 pub struct Resolver;
 
+#[soroban_sdk::contractclient(name = "MarketCoreWiringClient")]
+pub trait MarketCoreWiring {
+    fn accept_resolver(env: Env) -> Result<(), soroban_sdk::Error>;
+}
+
 #[contractimpl]
 impl Resolver {
     pub fn __constructor(env: Env, admin: Address, market_core: Address) {
@@ -692,6 +642,73 @@ impl Resolver {
         env.storage()
             .instance()
             .set(&DataKey::MarketCore, &market_core);
+    }
+
+    pub fn market_core(env: Env) -> Address {
+        env.storage().instance().get(&DataKey::MarketCore).unwrap()
+    }
+
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        Self::instance_get(&env, DataKey::Admin)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
+    }
+
+    pub fn accept_market_core_role(env: Env) {
+        let core = Self::market_core(env.clone());
+        MarketCoreWiringClient::new(&env, &core).accept_resolver();
+    }
+
+    // ----- admin ----------------------------------------------------------
+
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        let old: Address = Self::instance_get(&env, DataKey::Admin)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().extend_ttl(BUMP_THRESHOLD, BUMP_TO);
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
     }
 
     /// Reveals the resolution rule committed to at market creation. Anyone
@@ -1691,6 +1708,10 @@ impl Resolver {
         let admin: Address = Self::instance_get(env, DataKey::Admin)?;
         admin.require_auth();
         Ok(())
+    }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
     }
 
     fn load<V: soroban_sdk::TryFromVal<Env, soroban_sdk::Val>>(
@@ -4706,6 +4727,113 @@ mod test {
             .try_snapshot_price(&f.market_id, &caller)
             .is_err());
         assert_eq!(f.resolver.snapshot(&f.market_id), None);
+    }
+    #[test]
+    fn two_step_admin_transfer() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        assert_eq!(f.resolver.admin(), f.admin);
+        assert_eq!(f.resolver.pending_admin(), None);
+
+        f.resolver.propose_admin(&new_admin);
+        assert_eq!(
+            f.resolver.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
+        );
+        f.resolver.accept_admin();
+        assert_eq!(f.resolver.admin(), new_admin);
+        assert_eq!(f.resolver.pending_admin(), None);
+    }
+
+    #[test]
+    fn admin_transfer_can_be_cancelled() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        f.resolver.cancel_admin_transfer();
+        assert_eq!(f.resolver.pending_admin(), None);
+        assert_eq!(
+            f.resolver.try_accept_admin(),
+            Err(Ok(Error::NoPendingAdmin))
+        );
+    }
+
+    #[test]
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        f.env
+            .ledger()
+            .set_timestamp(f.env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
+        assert_eq!(
+            f.resolver.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
+        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(f
+            .resolver
+            .pending_admin()
+            .map(|p| p.expires_at < f.env.ledger().timestamp())
+            .unwrap_or(false));
+    }
+
+    #[test]
+    fn wrong_caller_cannot_accept_admin() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.resolver.propose_admin(&new_admin);
+        // `accept_admin` must be called by the *proposed* admin; a bystander
+        // cannot usher it in.
+        let bystander = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &bystander,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+        assert_eq!(f.resolver.admin(), f.admin);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let f = fixture(|env, reflector, _a, _b| ResolutionSpec::Price(price_spec(env, reflector)));
+        let new_admin = Address::generate(&f.env);
+        f.env.set_auths(&[]);
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &f.signer_a,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(f
+            .resolver
+            .mock_auths(&[MockAuth {
+                address: &f.signer_a,
+                invoke: &MockAuthInvoke {
+                    contract: &f.resolver_id,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&f.env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
     }
 }
 

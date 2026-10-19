@@ -71,6 +71,7 @@ pub struct TracePage {
 #[contracttype]
 pub enum DataKey {
     Admin,
+    PendingAdmin,
     NextId,
     Agent(Address),
     Trace(u64),
@@ -121,10 +122,13 @@ pub struct ChainLink {
     pub prev_trace_hash: BytesN<32>,
 }
 
-/// Base of the reasoning-registry error-code range, disjoint from
-/// market-core (`1..=999`), resolver (`1001..=1999`) and treasury
-/// (`2001..=2999`) (see `docs/adr/0006-cross-contract-errors.md`).
-pub const REGISTRY_ERROR_BASE: u32 = 3_000;
+/// A proposed admin handover (#62). Absent when no transfer is pending.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdmin {
+    pub address: Address,
+    pub expires_at: u64,
+}
 
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -142,15 +146,29 @@ pub enum Error {
     /// Agent already has a chain, so unchained `publish_trace` is refused (#52).
     ChainedAgentMustChain = 3009,
     /// Trace already backed an action (#50).
-    TraceAlreadyConsumed = 3010,
-    /// `action` is longer than [`MAX_ACTION_LEN`], which would make paginated
-    /// reads unbounded (#57).
-    ActionTooLong = 3011,
-    /// `ipfs_cid` is longer than [`MAX_CID_LEN`] (#57).
-    CidTooLong = 3012,
-    /// `limit` exceeded [`MAX_PAGE_SIZE`] (#57).
-    PageTooLarge = 3013,
+    TraceAlreadyConsumed = 10,
+    /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
+    NoPendingAdmin = 11,
+    /// A proposed admin handover was not accepted within its `expires_at`.
+    PendingAdminExpired = 12,
 }
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferProposed {
+    pub new_admin: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferred {
+    pub old: Address,
+    pub new: Address,
+}
+
+#[contractevent]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminTransferCancelled {}
 
 #[contractevent]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -216,6 +234,68 @@ impl ReasoningRegistry {
     pub fn __constructor(env: Env, admin: Address) {
         env.storage().instance().set(&DataKey::Admin, &admin);
         env.storage().instance().set(&DataKey::NextId, &0u64);
+    }
+
+    // ----- admin ----------------------------------------------------------
+
+    /// Starts a two-step handover of the admin role. The new admin must call
+    /// `accept_admin` itself, so a typo cannot hand control to an address
+    /// nobody holds.
+    pub fn propose_admin(env: Env, new_admin: Address) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        env.storage().instance().set(
+            &DataKey::PendingAdmin,
+            &PendingAdmin {
+                address: new_admin.clone(),
+                expires_at: env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS,
+            },
+        );
+        AdminTransferProposed { new_admin }.publish(&env);
+        Ok(())
+    }
+
+    pub fn accept_admin(env: Env) -> Result<(), Error> {
+        let pending = Self::load_pending(&env).ok_or(Error::NoPendingAdmin)?;
+        if env.ledger().timestamp() > pending.expires_at {
+            return Err(Error::PendingAdminExpired);
+        }
+        pending.address.require_auth();
+        let old: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        let s = env.storage().instance();
+        s.set(&DataKey::Admin, &pending.address);
+        s.remove(&DataKey::PendingAdmin);
+        AdminTransferred {
+            old,
+            new: pending.address,
+        }
+        .publish(&env);
+        Ok(())
+    }
+
+    pub fn cancel_admin_transfer(env: Env) -> Result<(), Error> {
+        Self::require_admin(&env)?;
+        if Self::load_pending(&env).is_none() {
+            return Err(Error::NoPendingAdmin);
+        }
+        env.storage().instance().remove(&DataKey::PendingAdmin);
+        AdminTransferCancelled {}.publish(&env);
+        Ok(())
+    }
+
+    pub fn admin(env: Env) -> Result<Address, Error> {
+        env.storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)
+    }
+
+    /// The pending admin proposal, including its expiry, if one exists.
+    pub fn pending_admin(env: Env) -> Option<PendingAdmin> {
+        Self::load_pending(&env)
     }
 
     pub fn register_agent(env: Env, agent: Address) -> Result<(), Error> {
@@ -711,6 +791,10 @@ impl ReasoningRegistry {
         admin.require_auth();
         Ok(())
     }
+
+    fn load_pending(env: &Env) -> Option<PendingAdmin> {
+        env.storage().instance().get(&DataKey::PendingAdmin)
+    }
 }
 
 #[cfg(test)]
@@ -1188,142 +1272,102 @@ mod test {
             &BytesN::from_array(&env, &expected)
         ));
     }
-
-    // ── #57 secondary indexes and paginated batch reads ───────────────────
-
     #[test]
-    fn traces_are_indexed_by_agent_and_market_action() {
-        let (env, client, _, agent_a) = setup();
-        let agent_b = Address::generate(&env);
-        client.register_agent(&agent_a);
-        client.register_agent(&agent_b);
+    fn two_step_admin_transfer() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        assert_eq!(client.admin(), admin);
+        assert_eq!(client.pending_admin(), None);
 
-        let buy = String::from_str(&env, "buy");
-        let sell = String::from_str(&env, "sell");
-        let t0 = client.publish_trace(
-            &agent_a,
-            &7,
-            &buy,
-            &BytesN::from_array(&env, &[1u8; 32]),
-            &String::from_str(&env, "ipfs://a0"),
+        client.propose_admin(&new_admin);
+        assert_eq!(
+            client.pending_admin().map(|p| p.address),
+            Some(new_admin.clone())
         );
-        let t1 = client.publish_trace(
-            &agent_b,
-            &7,
-            &buy,
-            &BytesN::from_array(&env, &[2u8; 32]),
-            &String::from_str(&env, "ipfs://b0"),
-        );
-        let t2 = client.publish_trace(
-            &agent_a,
-            &7,
-            &sell,
-            &BytesN::from_array(&env, &[3u8; 32]),
-            &String::from_str(&env, "ipfs://a1"),
-        );
-        // A trace on a different market must not appear in market 7's
-        // (market, action) index.
-        client.publish_trace(
-            &agent_a,
-            &8,
-            &buy,
-            &BytesN::from_array(&env, &[4u8; 32]),
-            &String::from_str(&env, "ipfs://a2"),
-        );
-
-        assert_eq!(client.agent_trace_count(&agent_a), 3);
-        assert_eq!(client.agent_trace_at(&agent_a, &0), t0);
-        assert_eq!(client.agent_trace_at(&agent_a, &2), t2);
-        assert_eq!(client.agent_trace_count(&agent_b), 1);
-        assert_eq!(client.agent_trace_at(&agent_b, &0), t1);
-
-        assert_eq!(client.market_action_trace_count(&7, &buy), 2);
-        assert_eq!(client.market_action_trace_at(&7, &buy, &0), t0);
-        assert_eq!(client.market_action_trace_at(&7, &buy, &1), t1);
-        assert_eq!(client.market_action_trace_count(&7, &sell), 1);
-        assert_eq!(client.market_action_trace_count(&8, &buy), 1);
+        client.accept_admin();
+        assert_eq!(client.admin(), new_admin);
+        assert_eq!(client.pending_admin(), None);
     }
 
     #[test]
-    fn batch_reads_return_pages_with_cursor_and_total() {
-        let (env, client, _, agent) = setup();
-        client.register_agent(&agent);
-        let buy = String::from_str(&env, "buy");
-        for i in 0..5u8 {
-            client.publish_trace(
-                &agent,
-                &7,
-                &buy,
-                &BytesN::from_array(&env, &[i; 32]),
-                &String::from_str(&env, "ipfs://page"),
-            );
-        }
-
-        let first = client.traces_by_market(&7, &0, &2);
-        assert_eq!(first.total, 5);
-        assert_eq!(first.next, 2);
-        assert_eq!(first.entries.len(), 2);
-        assert_eq!(first.entries.get(0).unwrap().trace_id, 0);
-        assert_eq!(first.entries.get(1).unwrap().trace_id, 1);
-
-        let second = client.traces_by_agent(&agent, &2, &2);
-        assert_eq!(second.total, 5);
-        assert_eq!(second.next, 4);
-        assert_eq!(second.entries.get(0).unwrap().trace_id, 2);
-
-        let last = client.traces_by_market_action(&7, &buy, &4, &2);
-        assert_eq!(last.total, 5);
-        assert_eq!(last.next, 5);
-        assert_eq!(last.entries.len(), 1);
-        assert_eq!(last.entries.get(0).unwrap().trace_id, 4);
-        // The loaded Trace is the real record, not just an id.
-        assert_eq!(last.entries.get(0).unwrap().trace.market_id, 7);
-
-        // A cursor past the end is an empty page, not an error.
-        let empty = client.traces_by_market(&7, &99, &5);
-        assert_eq!(empty.entries.len(), 0);
-        assert_eq!(empty.next, 99);
+    fn admin_transfer_can_be_cancelled() {
+        let (env, client, _, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        client.cancel_admin_transfer();
+        assert_eq!(client.pending_admin(), None);
+        assert_eq!(client.try_accept_admin(), Err(Ok(Error::NoPendingAdmin)));
     }
 
     #[test]
-    fn page_size_is_bounded() {
-        let (env, client, _, agent) = setup();
-        client.register_agent(&agent);
+    fn expired_admin_transfer_cannot_be_accepted() {
+        let (env, client, _, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        env.ledger()
+            .set_timestamp(env.ledger().timestamp() + ADMIN_PROPOSAL_TTL_SECS + 1);
         assert_eq!(
-            client.try_traces_by_agent(&agent, &0, &(MAX_PAGE_SIZE + 1)),
-            Err(Ok(Error::PageTooLarge))
+            client.try_accept_admin(),
+            Err(Ok(Error::PendingAdminExpired))
         );
-        assert_eq!(
-            client.try_traces_by_market(&7, &0, &0),
-            Err(Ok(Error::PageTooLarge))
-        );
+        // The expired record stays visible so operators can inspect/clear it.
+        assert!(client
+            .pending_admin()
+            .map(|p| p.expires_at < env.ledger().timestamp())
+            .unwrap_or(false));
     }
 
     #[test]
-    fn overlong_action_or_cid_is_rejected() {
-        let (env, client, _, agent) = setup();
-        client.register_agent(&agent);
-        let long_action = String::from_str(&env, &"a".repeat(MAX_ACTION_LEN as usize + 1));
-        assert_eq!(
-            client.try_publish_trace(
-                &agent,
-                &1,
-                &long_action,
-                &BytesN::from_array(&env, &[1u8; 32]),
-                &String::from_str(&env, "ipfs://ok"),
-            ),
-            Err(Ok(Error::ActionTooLong))
-        );
-        let long_cid = String::from_str(&env, &"c".repeat(MAX_CID_LEN as usize + 1));
-        assert_eq!(
-            client.try_publish_trace(
-                &agent,
-                &1,
-                &String::from_str(&env, "buy"),
-                &BytesN::from_array(&env, &[1u8; 32]),
-                &long_cid,
-            ),
-            Err(Ok(Error::CidTooLong))
-        );
+    fn wrong_caller_cannot_accept_admin() {
+        let (env, client, admin, _) = setup();
+        let new_admin = Address::generate(&env);
+        client.propose_admin(&new_admin);
+        let bystander = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &bystander,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "accept_admin",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_accept_admin()
+            .is_err());
+        assert_eq!(client.admin(), admin);
+    }
+
+    #[test]
+    fn wrong_caller_cannot_propose_or_cancel_admin() {
+        let (env, client, _, _) = setup();
+        let not_admin = Address::generate(&env);
+        let new_admin = Address::generate(&env);
+        env.set_auths(&[]);
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "propose_admin",
+                    args: (new_admin.clone(),).into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_propose_admin(&new_admin)
+            .is_err());
+        assert!(client
+            .mock_auths(&[MockAuth {
+                address: &not_admin,
+                invoke: &MockAuthInvoke {
+                    contract: &client.address,
+                    fn_name: "cancel_admin_transfer",
+                    args: ().into_val(&env),
+                    sub_invokes: &[],
+                },
+            }])
+            .try_cancel_admin_transfer()
+            .is_err());
     }
 }

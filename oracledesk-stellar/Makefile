@@ -7,7 +7,7 @@
 # agents/ and x402/ install, since both depend on them by local file: path
 # and need real type declarations, not just a package.json, to typecheck.
 setup:
-	for pkg in market-core resolver treasury reasoning-registry; do \
+	for pkg in market-core resolver treasury reasoning-registry timelock router; do \
 		(cd packages/bindings/$$pkg && npm install && npm run build) || exit 1; \
 	done
 	cd agents && npm install
