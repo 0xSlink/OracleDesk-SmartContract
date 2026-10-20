@@ -37,7 +37,9 @@ export interface Deployments {
   };
 }
 
-export function loadDeployments(path = join(REPO_ROOT, "deployments", "testnet.json")): Deployments {
+export function loadDeployments(
+  path = process.env.DEPLOYMENTS_PATH ?? join(REPO_ROOT, "deployments", "testnet.json"),
+): Deployments {
   return JSON.parse(readFileSync(path, "utf8")) as Deployments;
 }
 

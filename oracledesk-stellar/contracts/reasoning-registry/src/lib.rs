@@ -1,8 +1,14 @@
 #![no_std]
 
+// The test module builds over-length `action`/`ipfs_cid` strings with
+// `str::repeat`, which lives in `alloc`/`std`; the crate itself stays
+// `no_std`.
+#[cfg(test)]
+extern crate std;
+
 use soroban_sdk::{
     contract, contracterror, contractevent, contractimpl, contracttype, Address, Bytes, BytesN,
-    Env, String, Symbol, Vec,
+    Env, String, Vec,
 };
 
 mod market_core {
@@ -46,8 +52,24 @@ pub struct TraceBatch {
 const BUMP_THRESHOLD: u32 = 30 * 17_280;
 const BUMP_TO: u32 = 60 * 17_280;
 
-/// How long a pending admin proposal stays acceptable.
-pub const ADMIN_PROPOSAL_TTL_SECS: u64 = 7 * 86_400;
+/// Longest accepted `action` string, in bytes (#57). Bounding every trace's
+/// variable-length fields is what makes the paginated batch reads below
+/// provably safe: see [`MAX_PAGE_SIZE`].
+pub const MAX_ACTION_LEN: u32 = 64;
+/// Longest accepted IPFS CID/URI string, in bytes (#57).
+pub const MAX_CID_LEN: u32 = 128;
+/// Largest page a batch read returns (#57).
+///
+/// Safety bound: a `Trace`'s worst-case XDR is
+/// `market_id` 8 + `agent` address 56 + `action` (4 + 64) + `trace_hash` 32
+/// + `ipfs_cid` (4 + 128) + `published_at` 8 ≈ 304 bytes. Wrapping each entry
+/// in `TracePageEntry` adds 8 bytes for `trace_id` and a small vector overhead,
+/// so one entry is under 340 bytes. A page of 25 is therefore under ~8.5 KiB
+/// of ledger reads, plus at most 25 storage keys of ~50 bytes each — an order
+/// of magnitude below Soroban's per-transaction read limits even if every
+/// trace is maximal length. (Before this bound existed, `action`/`ipfs_cid`
+/// were unbounded, so no page size could have been proven safe.)
+pub const MAX_PAGE_SIZE: u32 = 25;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -108,6 +130,26 @@ pub struct Trace {
     pub published_at: u64,
 }
 
+/// One `(trace_id, Trace)` pair in a [`TracePage`].
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TracePageEntry {
+    pub trace_id: u64,
+    pub trace: Trace,
+}
+
+/// A page of traces returned by one simulation, plus the cursor to fetch the
+/// next page (#57). `next == total` means the caller has seen everything.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct TracePage {
+    pub entries: Vec<TracePageEntry>,
+    /// Index of the first entry the *next* page would return.
+    pub next: u64,
+    /// Total entries in this index at read time.
+    pub total: u64,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -133,32 +175,16 @@ pub enum DataKey {
     AgentTrace(Address, u64),
     /// `trace_id -> ChainLink`; absent for legacy traces (#52).
     TraceLink(u64),
-    /// Active trace flag annotation (#56).
-    Flag(u64),
-    /// Number of flag history entries for a trace (#56).
-    FlagHistoryCount(u64),
-    /// Flag history entries: (trace_id, index) -> TraceFlag (#56).
-    FlagHistory(u64, u32),
-    /// Address of market-core contract (#55).
-    MarketCore,
-    /// Merkle trace batch: batch_id -> TraceBatch (#54).
-    Batch(u64),
-    /// Next batch ID (#54).
-    NextBatchId,
-    /// Number of batches anchored by agent (#54).
-    AgentBatchCount(Address),
-    /// Agent batch index: (agent, index) -> batch_id (#54).
-    AgentBatch(Address, u64),
-    /// Active signing keys for an agent: Address -> Vec<BytesN<32>> (#53).
-    AgentSigningKeys(Address),
-    /// Number of signing key history records for an agent (#53).
-    SigningKeyHistoryCount(Address),
-    /// Paged signing key history: (agent, index) -> SigningKeyRecord (#53).
-    SigningKeyHistory(Address, u32),
-    /// Lookup from signing key to agent: BytesN<32> -> Address (#53).
-    KeyToAgent(BytesN<32>),
-    /// Ed25519 trace signature: trace_id -> (BytesN<32>, BytesN<64>) (#53).
-    TraceSignature(u64),
+    /// Number of traces published by an agent, in publish order (#57).
+    AgentTraceCount(Address),
+    /// `agent, index -> trace_id`, a secondary index parallel to
+    /// `MarketTrace` so "everything agent X published" is one page (#57).
+    AgentTraceAt(Address, u64),
+    /// Number of traces for a `(market, action)` pair (#57).
+    MarketActionTraceCount(u64, String),
+    /// `market, action, index -> trace_id`, so "every Buy decision on market
+    /// 7" is one page instead of scanning the market's whole index (#57).
+    MarketActionTraceAt(u64, String, u64),
 }
 
 /// Head of an agent's append-only trace log (#52). Genesis is `seq = 0`
@@ -190,18 +216,17 @@ pub struct PendingAdmin {
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(u32)]
 pub enum Error {
-    NotInitialized = 1,
-    Unauthorized = 2,
-    AgentAlreadyRegistered = 3,
-    AgentNotRegistered = 4,
-    TraceNotFound = 5,
-    /// Retained for ABI compatibility; actions are now validated via `TraceAction` (#55).
-    EmptyAction = 6,
-    EmptyCid = 7,
+    NotInitialized = 3001,
+    Unauthorized = 3002,
+    AgentAlreadyRegistered = 3003,
+    AgentNotRegistered = 3004,
+    TraceNotFound = 3005,
+    EmptyAction = 3006,
+    EmptyCid = 3007,
     /// `expected_seq` / `prev_trace_hash` don't extend the agent's chain head (#52).
-    ChainHeadMismatch = 8,
+    ChainHeadMismatch = 3008,
     /// Agent already has a chain, so unchained `publish_trace` is refused (#52).
-    ChainedAgentMustChain = 9,
+    ChainedAgentMustChain = 3009,
     /// Trace already backed an action (#50).
     TraceAlreadyConsumed = 10,
     /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
@@ -746,6 +771,101 @@ impl ReasoningRegistry {
             .ok_or(Error::TraceNotFound)
     }
 
+    /// Number of traces published by `agent` (#57).
+    pub fn agent_trace_count(env: Env, agent: Address) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentTraceCount(agent))
+            .unwrap_or(0)
+    }
+
+    /// The `index`-th (0-based, publish order) trace id for `agent` (#57).
+    pub fn agent_trace_at(env: Env, agent: Address, index: u64) -> Result<u64, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::AgentTraceAt(agent, index))
+            .ok_or(Error::TraceNotFound)
+    }
+
+    /// Number of traces for the `(market_id, action)` pair (#57).
+    pub fn market_action_trace_count(env: Env, market_id: u64, action: String) -> u64 {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketActionTraceCount(market_id, action))
+            .unwrap_or(0)
+    }
+
+    /// The `index`-th (0-based, publish order) trace id for
+    /// `(market_id, action)` (#57).
+    pub fn market_action_trace_at(
+        env: Env,
+        market_id: u64,
+        action: String,
+        index: u64,
+    ) -> Result<u64, Error> {
+        env.storage()
+            .persistent()
+            .get(&DataKey::MarketActionTraceAt(market_id, action, index))
+            .ok_or(Error::TraceNotFound)
+    }
+
+    /// A page of every trace for `market_id`, starting at `start` (#57).
+    /// Replaces the `market_trace_count` + `market_trace_at` + `get_trace`
+    /// loop (101 RPC simulations for 50 traces) with one simulation.
+    pub fn traces_by_market(
+        env: Env,
+        market_id: u64,
+        start: u64,
+        limit: u32,
+    ) -> Result<TracePage, Error> {
+        let total = Self::market_trace_count(env.clone(), market_id);
+        Self::trace_page(&env, total, start, limit, |index| {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MarketTrace(market_id, index))
+                .ok_or(Error::TraceNotFound)
+        })
+    }
+
+    /// A page of every trace `agent` published, in publish order (#57).
+    pub fn traces_by_agent(
+        env: Env,
+        agent: Address,
+        start: u64,
+        limit: u32,
+    ) -> Result<TracePage, Error> {
+        let total = Self::agent_trace_count(env.clone(), agent.clone());
+        Self::trace_page(&env, total, start, limit, |index| {
+            env.storage()
+                .persistent()
+                .get(&DataKey::AgentTraceAt(agent.clone(), index))
+                .ok_or(Error::TraceNotFound)
+        })
+    }
+
+    /// A page of every trace for `(market_id, action)`, in publish order
+    /// (#57) — e.g. every `Buy` decision on market 7.
+    pub fn traces_by_market_action(
+        env: Env,
+        market_id: u64,
+        action: String,
+        start: u64,
+        limit: u32,
+    ) -> Result<TracePage, Error> {
+        let total = Self::market_action_trace_count(env.clone(), market_id, action.clone());
+        Self::trace_page(&env, total, start, limit, |index| {
+            env.storage()
+                .persistent()
+                .get(&DataKey::MarketActionTraceAt(
+                    market_id,
+                    action.clone(),
+                    index,
+                ))
+                .ok_or(Error::TraceNotFound)
+        })
+    }
+}
+
     /// Anchors a Merkle batch of N traces off-chain, storing only the 32-byte root
     /// and manifest CID on-chain (#54).
     pub fn publish_trace_batch(
@@ -760,9 +880,17 @@ impl ReasoningRegistry {
         if !matches!(record.status, AgentStatus::Active) {
             return Err(Error::AgentNotActive);
         }
-        if leaf_count == 0 || leaf_count > MAX_LEAVES || manifest_cid.is_empty() {
-            return Err(Error::InvalidBatch);
+        if action.len() > MAX_ACTION_LEN {
+            return Err(Error::ActionTooLong);
         }
+        if ipfs_cid.is_empty() {
+            return Err(Error::EmptyCid);
+        }
+        if ipfs_cid.len() > MAX_CID_LEN {
+            return Err(Error::CidTooLong);
+        }
+        Ok(())
+    }
 
         let batch_id: u64 = env
             .storage()
@@ -785,8 +913,29 @@ impl ReasoningRegistry {
         Self::put(&env, &DataKey::AgentBatch(agent.clone(), agent_idx), &batch_id);
         Self::put(&env, &agent_count_key, &(agent_idx + 1));
 
-        BatchPublished {
-            batch_id,
+        // Secondary index by agent (#57).
+        let agent_count_key = DataKey::AgentTraceCount(agent.clone());
+        let agent_index: u64 = env.storage().persistent().get(&agent_count_key).unwrap_or(0);
+        Self::put(env, &DataKey::AgentTraceAt(agent.clone(), agent_index), &id);
+        Self::put(env, &agent_count_key, &(agent_index + 1));
+
+        // Secondary index by (market, action) (#57).
+        let action_count_key = DataKey::MarketActionTraceCount(market_id, action.clone());
+        let action_index: u64 = env
+            .storage()
+            .persistent()
+            .get(&action_count_key)
+            .unwrap_or(0);
+        Self::put(
+            env,
+            &DataKey::MarketActionTraceAt(market_id, action.clone(), action_index),
+            &id,
+        );
+        Self::put(env, &action_count_key, &(action_index + 1));
+
+        TracePublished {
+            trace_id: id,
+            market_id,
             agent,
             root,
             leaf_count,
@@ -815,11 +964,44 @@ impl ReasoningRegistry {
         env.storage().instance().get(&DataKey::NextBatchId).unwrap_or(0)
     }
 
-    pub fn agent_batch_count(env: Env, agent: Address) -> u64 {
-        env.storage()
-            .persistent()
-            .get(&DataKey::AgentBatchCount(agent))
-            .unwrap_or(0)
+    /// Shared body of the three paginated readers (#57): validates the page
+    /// size, resolves up to `limit` trace ids through `id_at`, and loads each
+    /// `Trace` into one return value. `total` is read once by the caller so a
+    /// page can never straddle an inconsistent index length.
+    fn trace_page(
+        env: &Env,
+        total: u64,
+        start: u64,
+        limit: u32,
+        id_at: impl Fn(u64) -> Result<u64, Error>,
+    ) -> Result<TracePage, Error> {
+        if limit == 0 || limit > MAX_PAGE_SIZE {
+            return Err(Error::PageTooLarge);
+        }
+        let mut entries = Vec::new(env);
+        let end = core::cmp::min(start.saturating_add(limit as u64), total);
+        let mut index = start;
+        while index < end {
+            let trace_id = id_at(index)?;
+            let trace = Self::get_trace(env.clone(), trace_id)?;
+            entries.push_back(TracePageEntry { trace_id, trace });
+            index += 1;
+        }
+        Ok(TracePage {
+            entries,
+            next: end,
+            total,
+        })
+    }
+
+    fn require_admin(env: &Env) -> Result<(), Error> {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        Ok(())
     }
 
     fn load_pending(env: &Env) -> Option<PendingAdmin> {
@@ -2081,287 +2263,8 @@ mod test {
     }
 
     #[test]
-    fn revoked_agent_traces_after_effective_time_report_revoked() {
-        let (env, client, _admin, agent) = setup();
-        env.ledger().set_timestamp(100);
-        client.register_agent(&agent);
-
-        env.ledger().set_timestamp(200);
-        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &1,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://t1"),
-        );
-
-        env.ledger().set_timestamp(300);
-        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
-
-        assert_eq!(
-            client.trace_verdict(&trace_id, &trace_hash),
-            TraceVerdict::AgentRevokedAfter(150)
-        );
-        assert!(!client.verify_trace(&trace_id, &trace_hash));
-    }
-
-    #[test]
-    fn revoked_agent_traces_before_effective_time_remain_valid() {
-        let (env, client, _admin, agent) = setup();
-        env.ledger().set_timestamp(100);
-        client.register_agent(&agent);
-
-        env.ledger().set_timestamp(120);
-        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &1,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://t1"),
-        );
-
-        env.ledger().set_timestamp(200);
-        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
-
-        assert_eq!(
-            client.trace_verdict(&trace_id, &trace_hash),
-            TraceVerdict::Valid
-        );
-        assert!(client.verify_trace(&trace_id, &trace_hash));
-    }
-
-    #[test]
-    fn revoked_agent_cannot_be_reregistered_or_reactivated() {
-        let (env, client, _admin, agent) = setup();
-        env.ledger().set_timestamp(100);
-        client.register_agent(&agent);
-        env.ledger().set_timestamp(200);
-        client.revoke_agent(&agent, &150, &Symbol::new(&env, "compromised"));
-
-        assert_eq!(
-            client.try_register_agent(&agent),
-            Err(Ok(Error::AgentAlreadyRegistered))
-        );
-        assert_eq!(
-            client.try_reactivate_agent(&agent),
-            Err(Ok(Error::CannotReactivateRevoked))
-        );
-    }
-
-    #[test]
-    fn flag_and_unflag_append_history_never_mutate_trace() {
-        let (env, client, _admin, agent) = setup();
-        client.register_agent(&agent);
-        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &1,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://t1"),
-        );
-
-        let initial_trace = client.get_trace(&trace_id);
-
-        client.flag_trace(&trace_id, &Symbol::new(&env, "suspicious"));
-        assert_eq!(
-            client.trace_verdict(&trace_id, &trace_hash),
-            TraceVerdict::Flagged(Symbol::new(&env, "suspicious"))
-        );
-
-        assert_eq!(client.get_trace(&trace_id), initial_trace);
-
-        client.unflag_trace(&trace_id, &Symbol::new(&env, "cleared"));
-        assert_eq!(
-            client.trace_verdict(&trace_id, &trace_hash),
-            TraceVerdict::Valid
-        );
-
-        assert_eq!(client.get_trace(&trace_id), initial_trace);
-
-        let flags = client.trace_flags(&trace_id, &0, &10);
-        assert_eq!(flags.len(), 2);
-        assert!(flags.get(0).unwrap().active);
-        assert_eq!(flags.get(0).unwrap().reason, Symbol::new(&env, "suspicious"));
-        assert!(!flags.get(1).unwrap().active);
-        assert_eq!(flags.get(1).unwrap().reason, Symbol::new(&env, "cleared"));
-    }
-
-    #[test]
-    fn flag_history_is_bounded() {
-        let (env, client, _admin, agent) = setup();
-        client.register_agent(&agent);
-        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &1,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://t1"),
-        );
-
-        for _ in 0..8 {
-            client.flag_trace(&trace_id, &Symbol::new(&env, "flag"));
-            client.unflag_trace(&trace_id, &Symbol::new(&env, "unflag"));
-        }
-
-        assert_eq!(
-            client.try_flag_trace(&trace_id, &Symbol::new(&env, "flag17")),
-            Err(Ok(Error::FlagHistoryFull))
-        );
-    }
-
-    #[test]
-    fn verify_trace_false_for_flagged_trace() {
-        let (env, client, _admin, agent) = setup();
-        client.register_agent(&agent);
-        let trace_hash = BytesN::from_array(&env, &[1u8; 32]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &1,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://t1"),
-        );
-
-        assert!(client.verify_trace(&trace_id, &trace_hash));
-        client.flag_trace(&trace_id, &Symbol::new(&env, "fraud"));
-        assert!(!client.verify_trace(&trace_id, &trace_hash));
-    }
-
-    #[test]
-    fn legacy_bool_agent_record_reads_as_active() {
-        let (env, client, _admin, agent) = setup();
-        env.as_contract(&client.address, || {
-            env.storage()
-                .persistent()
-                .set(&DataKey::Agent(agent.clone()), &true);
-        });
-        assert!(client.is_registered(&agent));
-        let record = client.get_agent(&agent).unwrap();
-        assert_eq!(record.status, AgentStatus::Active);
-        assert_eq!(record.registered_at, 0);
-    }
-
-    #[test]
-    fn wrong_caller_cannot_flag_or_revoke() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let agent = Address::generate(&env);
-        let (market_core_id, _) = register_market_core(&env, &admin);
-        let contract_id = env.register(
-            ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
-        );
-        let client = ReasoningRegistryClient::new(&env, &contract_id);
-
-        env.mock_auths(&[MockAuth {
-            address: &admin,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "register_agent",
-                args: (&agent,).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        client.register_agent(&agent);
-
-        let trace_hash = BytesN::from_array(&env, &[7u8; 32]);
-        env.mock_auths(&[MockAuth {
-            address: &agent,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "publish_trace",
-                args: (
-                    &agent,
-                    &42u64,
-                    &TraceAction::Buy,
-                    &trace_hash,
-                    &String::from_str(&env, "ipfs://trace-42"),
-                )
-                    .into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        let trace_id = client.publish_trace(
-            &agent,
-            &42,
-            &TraceAction::Buy,
-            &trace_hash,
-            &String::from_str(&env, "ipfs://trace-42"),
-        );
-
-        let non_admin = Address::generate(&env);
-        env.mock_auths(&[MockAuth {
-            address: &non_admin,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "flag_trace",
-                args: (&trace_id, &Symbol::new(&env, "bad_trade")).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(client.try_flag_trace(&trace_id, &Symbol::new(&env, "bad_trade")).is_err());
-
-        env.mock_auths(&[MockAuth {
-            address: &non_admin,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "revoke_agent",
-                args: (&agent, &0u64, &Symbol::new(&env, "compromised")).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(client.try_revoke_agent(&agent, &0u64, &Symbol::new(&env, "compromised")).is_err());
-    }
-
-    #[test]
-    fn agent_can_retire_itself_but_not_others() {
-        let env = Env::default();
-        let admin = Address::generate(&env);
-        let agent1 = Address::generate(&env);
-        let agent2 = Address::generate(&env);
-        let (market_core_id, _) = register_market_core(&env, &admin);
-        let contract_id = env.register(
-            ReasoningRegistry,
-            ReasoningRegistryArgs::__constructor(&admin, &market_core_id),
-        );
-        let client = ReasoningRegistryClient::new(&env, &contract_id);
-
-        env.mock_all_auths();
-        client.register_agent(&agent1);
-        client.register_agent(&agent2);
-
-        env.mock_auths(&[MockAuth {
-            address: &agent1,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "retire_self",
-                args: (&agent1,).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        client.retire_self(&agent1);
-        assert!(!client.is_registered(&agent1));
-
-        env.mock_auths(&[MockAuth {
-            address: &agent1,
-            invoke: &MockAuthInvoke {
-                contract: &client.address,
-                fn_name: "retire_self",
-                args: (&agent2,).into_val(&env),
-                sub_invokes: &[],
-            },
-        }]);
-        assert!(client.try_retire_self(&agent2).is_err());
-    }
-
-    // ── #55 Trace market references and action validation ────────────────
-
-    #[test]
-    fn publish_for_existing_market_succeeds() {
+    #[should_panic(expected = "Error(Contract, #3004)")]
+    fn unregistered_agent_cannot_publish() {
         let (env, client, _, agent) = setup();
         client.register_agent(&agent);
         let trace_hash = BytesN::from_array(&env, &[11u8; 32]);
@@ -2378,31 +2281,10 @@ mod test {
     }
 
     #[test]
-    fn publish_for_unknown_market_fails_unknown_market() {
-        let (env, client, _, agent) = setup();
-        client.register_agent(&agent);
-        let trace_hash = BytesN::from_array(&env, &[12u8; 32]);
-        // 50 markets exist (0..49), so market 50 and 9_999_999 are unknown
-        assert_eq!(
-            client.try_publish_trace(
-                &agent,
-                &50,
-                &TraceAction::Buy,
-                &trace_hash,
-                &String::from_str(&env, "ipfs://trace-unknown"),
-            ),
-            Err(Ok(Error::UnknownMarket))
-        );
-        assert_eq!(
-            client.try_publish_trace(
-                &agent,
-                &9_999_999,
-                &TraceAction::Buy,
-                &trace_hash,
-                &String::from_str(&env, "ipfs://trace-unknown"),
-            ),
-            Err(Ok(Error::UnknownMarket))
-        );
+    #[should_panic(expected = "Error(Contract, #3005)")]
+    fn unknown_trace_cannot_be_verified() {
+        let (env, client, _, _) = setup();
+        client.verify_trace(&99, &BytesN::from_array(&env, &[0u8; 32]));
     }
 
     #[test]

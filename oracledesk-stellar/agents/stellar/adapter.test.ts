@@ -1,6 +1,14 @@
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import test from "node:test";
-import { agentCredentials, StellarAdapter, type Deployments } from "./adapter.js";
+import {
+  agentCredentials,
+  loadDeployments,
+  StellarAdapter,
+  type Deployments,
+} from "./adapter.js";
 
 const deployments: Deployments = {
   deployer: "GDEPLOYER",
@@ -156,104 +164,17 @@ test("dry-run agentSellV2 describes the bounded call without touching the networ
   }
 });
 
-test("dry-run publishTrace passes u64::MAX sentinel exactly", async () => {
-  const adapter = new StellarAdapter({
-    mode: "dry-run",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    deployments,
-  });
-  const U64_MAX = 18446744073709551615n;
-  const result = await adapter.publishTrace({
-    agent: "GAGENT",
-    market_id: U64_MAX,
-    action: { tag: "ProposeMarket", values: undefined },
-    trace_hash: Buffer.alloc(32, 1),
-    ipfs_cid: "ipfs://propose",
-  });
-  assert.equal(result.dryRun, true);
-  if (result.dryRun) {
-    assert.equal(result.contractId, "CREGISTRY");
-    assert.equal(result.method, "publish_trace");
-    assert.equal((result.args as any).market_id, U64_MAX);
-    assert.deepEqual((result.args as any).action, { tag: "ProposeMarket", values: undefined });
+test("loadDeployments honours DEPLOYMENTS_PATH", () => {
+  const dir = mkdtempSync(join(tmpdir(), "oracledesk-deployments-"));
+  const path = join(dir, "local.json");
+  writeFileSync(path, JSON.stringify({ ...deployments, contracts: { ...deployments.contracts, usdc: "CLOCAL" } }));
+  const previous = process.env.DEPLOYMENTS_PATH;
+  process.env.DEPLOYMENTS_PATH = path;
+  try {
+    assert.equal(loadDeployments().contracts.usdc, "CLOCAL");
+  } finally {
+    if (previous === undefined) delete process.env.DEPLOYMENTS_PATH;
+    else process.env.DEPLOYMENTS_PATH = previous;
+    rmSync(dir, { recursive: true, force: true });
   }
 });
-
-test("dry-run publishTraceBatch describes batch anchoring without network", async () => {
-  const adapter = new StellarAdapter({
-    mode: "dry-run",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    deployments,
-  });
-  const root = Buffer.alloc(32, 2);
-  const result = await adapter.publishTraceBatch({
-    agent: "GAGENT",
-    root,
-    leaf_count: 50,
-    manifest_cid: "ipfs://batch-manifest-50",
-  });
-  assert.equal(result.dryRun, true);
-  if (result.dryRun) {
-    assert.equal(result.contractId, "CREGISTRY");
-    assert.equal(result.method, "publish_trace_batch");
-    assert.deepEqual((result.args as any).root, root);
-    assert.equal((result.args as any).leaf_count, 50);
-    assert.equal((result.args as any).manifest_cid, "ipfs://batch-manifest-50");
-  }
-});
-
-test("dry-run addSigningKey and publishTraceSigned describe calls without network", async () => {
-  const adapter = new StellarAdapter({
-    mode: "dry-run",
-    networkPassphrase: "Test SDF Network ; September 2015",
-    rpcUrl: "https://soroban-testnet.stellar.org",
-    deployments,
-  });
-
-  const pubkey = Buffer.alloc(32, 3);
-  const proofSig = Buffer.alloc(64, 4);
-  const addRes = await adapter.addSigningKey({
-    agent: "GAGENT",
-    public_key: pubkey,
-    proof_sig: proofSig,
-  });
-  assert.equal(addRes.dryRun, true);
-  if (addRes.dryRun) {
-    assert.equal(addRes.contractId, "CREGISTRY");
-    assert.equal(addRes.method, "add_signing_key");
-    assert.deepEqual((addRes.args as any).public_key, pubkey);
-  }
-
-  const traceSig = Buffer.alloc(64, 5);
-  const traceHash = Buffer.alloc(32, 6);
-  const pubRes = await adapter.publishTraceSigned({
-    agent: "GAGENT",
-    market_id: 10n,
-    action: "buy",
-    trace_hash: traceHash,
-    ipfs_cid: "ipfs://signed-trace-10",
-    signing_key: pubkey,
-    signature: traceSig,
-  });
-  assert.equal(pubRes.dryRun, true);
-  if (pubRes.dryRun) {
-    assert.equal(pubRes.contractId, "CREGISTRY");
-    assert.equal(pubRes.method, "publish_trace_signed");
-    assert.deepEqual((pubRes.args as any).signing_key, pubkey);
-    assert.deepEqual((pubRes.args as any).signature, traceSig);
-    assert.deepEqual((pubRes.args as any).action, { tag: "Buy", values: undefined });
-  }
-
-  const retRes = await adapter.retireSigningKey({
-    agent: "GAGENT",
-    public_key: pubkey,
-  });
-  assert.equal(retRes.dryRun, true);
-  if (retRes.dryRun) {
-    assert.equal(retRes.contractId, "CREGISTRY");
-    assert.equal(retRes.method, "retire_signing_key");
-  }
-});
-

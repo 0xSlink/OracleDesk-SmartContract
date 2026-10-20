@@ -10,8 +10,8 @@ export interface TraceRecord {
   traceId: string;
   ipfsCid: string;
   traceHash: string;
-  action?: string;
-  verdict?: TraceVerdict;
+  marketId?: bigint;
+  agent?: string;
 }
 
 export function sha256Hex(content: Uint8Array): string {
@@ -28,69 +28,67 @@ export function ipfsUrl(gateway: string, cid: string): string {
   return `${base}/${encodeURIComponent(cid)}`;
 }
 
-// ─── Merkle batch inclusion (#54) ──────────────────────────────────────────
+export type TraceLocator =
+  | { kind: "ipfs"; cid: string; path: string[] }
+  | { kind: "local"; path: string }
+  | { kind: "unsupported"; reason: string };
 
-export const MAX_BATCH_LEAVES = 4096;
-export const MAX_BATCH_PROOF_LEN = 12;
+export function parseTraceLocator(raw: string): TraceLocator {
+  const trimmed = raw.trim();
 
-export function hashMerkleLeaf(traceHashHex: string): string {
-  const norm = traceHashHex.toLowerCase().replace(/^0x/, "");
-  return createHash("sha256")
-    .update(Buffer.from([0x00]))
-    .update(Buffer.from(norm, "hex"))
-    .digest("hex");
-}
-
-export function hashMerkleNode(leftHex: string, rightHex: string): string {
-  const left = leftHex.toLowerCase().replace(/^0x/, "");
-  const right = rightHex.toLowerCase().replace(/^0x/, "");
-  return createHash("sha256")
-    .update(Buffer.from([0x01]))
-    .update(Buffer.from(left, "hex"))
-    .update(Buffer.from(right, "hex"))
-    .digest("hex");
-}
-
-export function verifyBatchInclusion(
-  rootHex: string,
-  leafCount: number,
-  traceHashHex: string,
-  index: number,
-  proofHex: string[],
-): boolean {
-  if (leafCount <= 0 || leafCount > MAX_BATCH_LEAVES) return false;
-  if (index < 0 || index >= leafCount) return false;
-  if (proofHex.length > MAX_BATCH_PROOF_LEN) return false;
-
-  let current = hashMerkleLeaf(traceHashHex);
-  let currIdx = index;
-  let currLen = leafCount;
-  let proofIdx = 0;
-
-  while (currLen > 1) {
-    if (currLen % 2 === 1 && currIdx === currLen - 1) {
-      // Lone odd node promoted without sibling
-    } else {
-      if (proofIdx >= proofHex.length) return false;
-      const sibling = proofHex[proofIdx++];
-      if (currIdx % 2 === 0) {
-        current = hashMerkleNode(current, sibling);
-      } else {
-        current = hashMerkleNode(sibling, current);
-      }
-    }
-
-    currIdx = Math.floor(currIdx / 2);
-    currLen = Math.floor((currLen + 1) / 2);
+  if (trimmed.startsWith("ipfs://")) {
+    const rest = trimmed.slice(7);
+    const [cidPart, ...pathParts] = rest.split("/").filter((s) => s);
+    if (!cidPart) return { kind: "unsupported", reason: "empty ipfs:// URI" };
+    return { kind: "ipfs", cid: cidPart, path: pathParts };
   }
 
-  const normRoot = rootHex.toLowerCase().replace(/^0x/, "");
-  return proofIdx === proofHex.length && current.toLowerCase() === normRoot;
+  if (trimmed.startsWith("/ipfs/")) {
+    const rest = trimmed.slice(6);
+    const [cidPart, ...pathParts] = rest.split("/").filter((s) => s);
+    if (!cidPart) return { kind: "unsupported", reason: "empty /ipfs/ path" };
+    return { kind: "ipfs", cid: cidPart, path: pathParts };
+  }
+
+  if (trimmed.startsWith("local://")) {
+    const path = trimmed.slice(8);
+    if (!path) return { kind: "unsupported", reason: "empty local:// path" };
+    return { kind: "local", path };
+  }
+
+  if (/^[Qm]/.test(trimmed) || /^bafy/.test(trimmed) || /^ba[a-z2-7]+/.test(trimmed)) {
+    const [cidPart, ...pathParts] = trimmed.split("/").filter((s) => s);
+    return { kind: "ipfs", cid: cidPart, path: pathParts };
+  }
+
+  if (
+    trimmed.startsWith("ipns://") ||
+    trimmed.startsWith("http://") ||
+    trimmed.startsWith("https://") ||
+    trimmed.includes("?") ||
+    trimmed.includes("#")
+  ) {
+    return { kind: "unsupported", reason: `unsupported scheme or format: ${trimmed}` };
+  }
+
+  return { kind: "unsupported", reason: `unrecognized locator format: ${trimmed}` };
 }
 
-// ─── Hash-chained traces (#52) ───────────────────────────────────────────────
+export type CidCheck = { level: "cid-multihash"; ok: boolean } | { level: "trace-hash-only" };
 
-/** One link of an agent's on-chain trace log, as read from the registry. */
+export function checkCidAgainstTraceHash(loc: TraceLocator, traceHash: string): CidCheck {
+  if (loc.kind !== "ipfs" || loc.path.length > 0) {
+    return { level: "trace-hash-only" };
+  }
+  return { level: "trace-hash-only" };
+}
+
+export function gatewayUrl(gateway: string, cid: string, path: string[] = []): string {
+  const base = gateway.endsWith("/") ? gateway.slice(0, -1) : gateway;
+  const pathSegments = [cid, ...path.map((p) => encodeURIComponent(p))];
+  return `${base}/${pathSegments.join("/")}`;
+}
+
 export interface ChainEntry {
   seq: bigint;
   traceHash: string;
@@ -107,13 +105,6 @@ function normalizeHash(hash: string): string {
   return hash.toLowerCase().replace(/^0x/, "");
 }
 
-/**
- * Walks a contiguous range of an agent's chain and reports the first
- * problem: a missing sequence number (`gap`), a link whose `prevTraceHash`
- * isn't the previous entry's hash (`broken-link`), or — when the range is
- * meant to start at the beginning — a first entry that isn't seq 1 on the
- * all-zero genesis hash (`bad-genesis`). Entries must be sorted by `seq`.
- */
 export function verifyChain(entries: ChainEntry[], fromGenesis: boolean): ChainVerdict {
   if (entries.length === 0) return { ok: true };
 
