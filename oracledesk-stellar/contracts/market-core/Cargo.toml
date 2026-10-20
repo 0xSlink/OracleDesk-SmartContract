@@ -9,6 +9,7 @@ crate-type = ["cdylib", "rlib"]
 doctest = false
 
 [dependencies]
+oracledesk-types = { path = "../oracledesk-types" }
 soroban-sdk = "27.0.6"
 
 [dev-dependencies]
