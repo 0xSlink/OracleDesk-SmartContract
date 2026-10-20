@@ -31,6 +31,10 @@ yarn-error.log*
 # V2 resolution specs written by scripts/seed-market.sh. The salt inside each
 # file is a secret until its market's spec is revealed, so never commit them.
 deployments/specs/
+deployments/specs-local/
+deployments/local*.json
+deployments/traces-*/
+!deployments/*.example.json
 
 # Agent dry-run/local trace output (agents/core/trace.ts's LocalTraceStore)
 .traces/
@@ -39,7 +43,4 @@ deployments/specs/
 .vscode/
 .idea/
 .DS_Store
-
-# Python
 __pycache__/
-*.pyc
