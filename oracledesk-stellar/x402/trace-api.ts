@@ -65,6 +65,12 @@ export interface TraceApiOptions {
   price: string;
   networks: TracePaymentNetwork[];
   fetchImpl?: typeof fetch;
+  /**
+   * Test-harness hook: skip the x402 payment middleware entirely. The local
+   * E2E harness verifies the registry lookup and on-chain hash path without a
+   * facilitator. Never set this in a paid deployment.
+   */
+  paymentsDisabled?: boolean;
 }
 
 export class MapTraceRepository implements TraceRepository {
@@ -138,14 +144,18 @@ function createPaymentHandler(config: TracePaymentNetwork, options: TraceApiOpti
 }
 
 export function createTraceApi(options: TraceApiOptions): Express {
-  if (options.networks.length === 0) {
+  if (options.networks.length === 0 && !options.paymentsDisabled) {
     throw new Error("At least one x402 Stellar payment network is required");
   }
   const fetchImpl = options.fetchImpl ?? fetch;
   const app = express();
 
-  for (const network of options.networks) {
-    app.use(createPaymentHandler(network, options));
+  if (!options.paymentsDisabled) {
+    for (const network of options.networks) {
+      app.use(createPaymentHandler(network, options));
+    }
+  } else {
+    console.warn("OracleDesk x402: payment middleware disabled (test harness only)");
   }
 
   app.get("/traces/:traceId", async (req: Request, res: Response) => {

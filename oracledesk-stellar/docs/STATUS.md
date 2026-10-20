@@ -6,6 +6,50 @@ works, what's unverified, and what's left. Everything marked "verified" was
 demonstrated with real command output in the session that wrote this file,
 not asserted.
 
+## Contributor addendum: 2026-10-20 (verification wave)
+
+Four verification tracks landed together on
+`feat/auth-matrix-kani-system-model-e2e`:
+
+- **Cross-contract auth matrix** (`contracts/integration-tests`): a wasm-based
+  world imports the shipping `market_core`, `resolver`, `treasury` and
+  `reasoning_registry` artifacts, wires them exactly like the deploy scripts,
+  and asserts `env.auths()` against exact signer/sub-invocation trees. Negative
+  cases attempt the same entrypoints with the wrong signer and assert the call
+  fails. `every_entrypoint_has_a_matrix_row` reads each wasm `contractspecv0`
+  and fails if an exported entrypoint has no positive row. The crate never
+  calls `mock_all_auths`; `scripts/check-no-mock-all-auths.sh` enforces that
+  and `make lint` runs it.
+- **Kani proofs** (`contracts/market-core/src/math_proofs.rs`): local proofs
+  for `mul_div_floor`/`ceil` bounds and invalid inputs, `calc_buy`/`calc_sell`
+  positivity and constant-product monotonicity, `seed_reserves` accuracy,
+  round-trip no-profit, and spot-price bounds. See
+  `docs/formal-verification.md`. **Not run in this contributor session** —
+  Kani is not installed on the workstation; `.github/workflows/kani.yml` is
+  the verification path.
+- **Stateful system model** (`model/system_model.py` +
+  `contracts/integration-tests/tests/system_model.rs`): a versioned JSON trace
+  is replayed by a Python model and executed against the real wasm contracts.
+  Every step's success/failure and full snapshot (reserves, positions, token
+  balances, resolver state, registry counters) must agree. The harness uses
+  proptest with shrinking and committed regressions under
+  `model/regressions/`. Verified locally: model selftest, committed traces and
+  a 12-case proptest run.
+- **Local hermetic E2E** (`scripts/e2e-local.sh`,
+  `.github/workflows/e2e.yml`, `contracts/test-oracle`): parameterizes the
+  deploy/seed/demo scripts over `NETWORK=testnet|local`, deploys a local-only
+  Reflector-shaped oracle, resolves markets in both signer and price modes,
+  runs the TypeScript trader live against the quickstart network, and fetches
+  a trace through x402 with on-chain hash verification. Also **not executed
+  end-to-end in this contributor session**; the workflow is the CI path. The
+  fake oracle is refused outside `NETWORK=local`.
+
+Commands that were run locally for this addendum: `cargo test -p
+integration-tests --test auth_matrix`, `cargo test -p integration-tests
+--test system_model`, `python3 model/system_model.py --selftest`, and
+`python3 model/fpmm_model.py`. The full workspace run is recorded below in
+the wave's final validation notes.
+
 ## Contributor addendum: 2026-10-16
 
 Fee split + recipient snapshot (#8), per-market circuit breakers (#10),

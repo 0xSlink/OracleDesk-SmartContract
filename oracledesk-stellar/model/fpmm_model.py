@@ -121,6 +121,16 @@ def calc_sell(r_sold: int, r_other: int, collateral_out: int, fee_bps: int) -> S
     return SellQuote(shares_in, fee, gross, new_sold, new_other)
 
 
+def split_fee(fee: int, protocol_share_bps: int) -> tuple[int, int]:
+    """Split a trade fee into (protocol, lp) portions. Mirrors
+    math.rs::split_fee: the protocol share is rounded up so the pool can
+    never be left with a negative LP side."""
+    if fee < 0 or protocol_share_bps > BPS:
+        raise MathError("invalid input")
+    protocol = mul_div_ceil(fee, protocol_share_bps, BPS)
+    return protocol, fee - protocol
+
+
 def settle_value(kind: str, yes: int, no: int) -> int:
     if kind == "yes":
         return yes
@@ -223,6 +233,10 @@ def _check_known_values():
         1112,
         900,
     ), q
+
+    assert split_fee(100, 0) == (0, 100)
+    assert split_fee(100, BPS) == (100, 0)
+    assert split_fee(101, 5_000) == (51, 50)
 
 
 def _check_seed_opens_at_requested_probability():
