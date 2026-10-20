@@ -56,6 +56,75 @@ const BPS: i128 = 10_000;
 /// market-core's `Error::SlippageExceeded` (pinned by a test).
 const CORE_SLIPPAGE_EXCEEDED: u32 = 12;
 
+/// Maps a typed market-core error (from a generated `try_*` call) into the
+/// treasury's own disjoint range. Unmapped conditions collapse to
+/// [`Error::MarketCoreCallFailed`] rather than leaking market-core's code.
+fn map_market_core_error(error: market_core::Error) -> Error {
+    use market_core::Error as Core;
+    match error {
+        Core::MarketNotFound => Error::MarketCoreMarketNotFound,
+        Core::NotFinal => Error::MarketCoreNotFinal,
+        Core::MarketNotOpen => Error::MarketCoreMarketNotOpen,
+        Core::MarketClosed => Error::MarketCoreMarketClosed,
+        Core::InsufficientLiquidity => Error::MarketCoreInsufficientLiquidity,
+        Core::InsufficientShares => Error::MarketCoreInsufficientShares,
+        Core::AlreadyClaimed => Error::MarketCoreAlreadyClaimed,
+        Core::NothingToRedeem => Error::MarketCoreNothingToRedeem,
+        Core::InvalidAmount => Error::MarketCoreInvalidAmount,
+        Core::Overflow => Error::MarketCoreOverflow,
+        Core::SlippageExceeded => Error::MarketCoreSlippageExceeded,
+        _ => Error::MarketCoreCallFailed,
+    }
+}
+
+/// Same mapping as [`map_market_core_error`], but for the numeric
+/// `soroban_sdk::Error` returned by `try_invoke_contract` (which cannot be
+/// decoded into `market_core::Error` without exporting that type).
+fn map_market_core_code(error: soroban_sdk::Error) -> Error {
+    let code = |value: u32| soroban_sdk::Error::from_contract_error(value);
+    use market_core::Error as Core;
+    if error == code(Core::MarketNotFound as u32) {
+        Error::MarketCoreMarketNotFound
+    } else if error == code(Core::NotFinal as u32) {
+        Error::MarketCoreNotFinal
+    } else if error == code(Core::MarketNotOpen as u32) {
+        Error::MarketCoreMarketNotOpen
+    } else if error == code(Core::MarketClosed as u32) {
+        Error::MarketCoreMarketClosed
+    } else if error == code(Core::InsufficientLiquidity as u32) {
+        Error::MarketCoreInsufficientLiquidity
+    } else if error == code(Core::InsufficientShares as u32) {
+        Error::MarketCoreInsufficientShares
+    } else if error == code(Core::AlreadyClaimed as u32) {
+        Error::MarketCoreAlreadyClaimed
+    } else if error == code(Core::NothingToRedeem as u32) {
+        Error::MarketCoreNothingToRedeem
+    } else if error == code(Core::InvalidAmount as u32) {
+        Error::MarketCoreInvalidAmount
+    } else if error == code(Core::Overflow as u32) {
+        Error::MarketCoreOverflow
+    } else if error == code(Core::SlippageExceeded as u32) {
+        Error::MarketCoreSlippageExceeded
+    } else {
+        Error::MarketCoreCallFailed
+    }
+}
+
+/// Runs a generated `try_*` market-core call, mapping both the callee error
+/// and a host/invocation failure into treasury variants. Every cross-contract
+/// market-core call must go through this (or [`Treasury::core_trade`] for the
+/// name-dispatched trade calls); the panicking generated methods are never
+/// used.
+fn core_call<T>(
+    result: Result<Result<T, market_core::Error>, Result<soroban_sdk::Error, soroban_sdk::InvokeError>>,
+) -> Result<T, Error> {
+    match result {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(error)) => Err(map_market_core_error(error)),
+        Err(_) => Err(Error::MarketCoreCallFailed),
+    }
+}
+
 /// Agent role bits (`AgentPolicy.roles`). A bitmask rather than a
 /// `Vec<Role>`: cheaper to store and check, and `#[contracttype]` enums
 /// cannot be used as flags.
@@ -486,7 +555,7 @@ pub enum Error {
     YieldWithdrawFailed = 42,
     VenueHasPrincipal = 43,
     /// Category exposure would exceed its correlation cap (#49).
-    CategoryCapExceeded = 29,
+    CategoryCapExceeded = 2029,
     /// Close-date bucket exposure would exceed its cap (#49).
     BucketCapExceeded = 30,
     /// `accept_admin`/`cancel_admin_transfer` called with nothing proposed.
@@ -1042,7 +1111,7 @@ impl Treasury {
     /// `get_position`); a view only, never on the trading path.
     pub fn market_valuation(env: Env, market_id: u64) -> Result<Valuation, Error> {
         let global = Self::load_global(&env)?;
-        let (floor_value, spot_value) = Self::holdings_value(&env, &global.market_core, market_id);
+        let (floor_value, spot_value) = Self::holdings_value(&env, &global.market_core, market_id)?;
         let cost_basis = Self::load_net(&env, &global.market_core, market_id).cost_basis();
         Ok(Valuation {
             cost_basis,
@@ -1706,7 +1775,7 @@ impl Treasury {
 
         let treasury_addr = env.current_contract_address();
         Self::authorize_token_pull(&env, &global, &treasury_addr, seed_amount);
-        let market_id = MarketCoreClient::new(&env, &global.market_core).create_market(
+        let market_id = core_call(MarketCoreClient::new(&env, &global.market_core).try_create_market(
             &treasury_addr,
             &question_hash,
             &resolution_hash,
@@ -1715,7 +1784,7 @@ impl Treasury {
             &close_time,
             &seed_amount,
             &initial_yes_bps,
-        );
+        ))?;
         Self::reserve_capacity(&env, &global, &agent, &policy, market_id, seed_amount)?;
         Self::reserve_net(&env, &global, market_id, seed_amount)?;
         Self::record_cost(&env, market_id, seed_amount)?;
@@ -1926,7 +1995,9 @@ impl Treasury {
     pub fn agent_claim_lp_fees(env: Env, agent: Address, market_id: u64) -> Result<i128, Error> {
         let global = Self::load_global(&env)?;
         Self::require_agent(&env, &agent, ROLE_SETTLE)?;
-        let amount = MarketCoreClient::new(&env, &global.market_core).claim_lp_fees(&market_id);
+        let amount = core_call(
+            MarketCoreClient::new(&env, &global.market_core).try_claim_lp_fees(&market_id),
+        )?;
         Self::record_return(&env, &global.market_core, market_id, amount)?;
         Ok(amount)
     }
@@ -1941,7 +2012,8 @@ impl Treasury {
     pub fn collect_market_fees(env: Env, market_id: u64) -> Result<i128, Error> {
         Self::require_admin(&env)?;
         let global = Self::load_global(&env)?;
-        let amount = MarketCoreClient::new(&env, &global.market_core).sweep_fees(&market_id);
+        let amount =
+            core_call(MarketCoreClient::new(&env, &global.market_core).try_sweep_fees(&market_id))?;
         FeesCollected { market_id, amount }.publish(&env);
         Ok(amount)
     }
@@ -2707,11 +2779,11 @@ impl Treasury {
 
         let prices = Self::load_price_policy(&env);
         let client = MarketCoreClient::new(&env, &global.market_core);
-        let p_before = client.get_price(&market_id, &outcome);
+        let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_before > prices.max_buy_price_bps {
             return Err(Error::PriceOutOfBand);
         }
-        let quoted = client.quote_buy(&market_id, &outcome, &collateral_in);
+        let quoted = core_call(client.try_quote_buy(&market_id, &outcome, &collateral_in))?;
         let floor = price_math::mul_div_floor(quoted, BPS - prices.max_slippage_bps as i128, BPS)
             .ok_or(Error::InvalidAmount)?;
         let effective_min = min_shares_out.max(floor.max(1));
@@ -2740,7 +2812,7 @@ impl Treasury {
         ];
         let fn_name = Self::push_bound(&env, &mut args, bound, "buy", "buy_v2");
         let shares = Self::core_trade(&env, &global.market_core, fn_name, args)?;
-        let p_after = client.get_price(&market_id, &outcome);
+        let p_after = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
@@ -2778,11 +2850,11 @@ impl Treasury {
         let prices = Self::load_price_policy(&env);
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(&env, &global.market_core);
-        let p_before = client.get_price(&market_id, &outcome);
+        let p_before = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_before < prices.min_sell_price_bps {
             return Err(Error::PriceOutOfBand);
         }
-        let quoted = client.quote_sell(&market_id, &outcome, &collateral_out);
+        let quoted = core_call(client.try_quote_sell(&market_id, &outcome, &collateral_out))?;
         let cap = price_math::mul_div_ceil(quoted, BPS + prices.max_slippage_bps as i128, BPS)
             .ok_or(Error::InvalidAmount)?;
         let effective_max = max_shares_in.min(cap);
@@ -2796,7 +2868,7 @@ impl Treasury {
         ];
         let fn_name = Self::push_bound(&env, &mut args, bound, "sell", "sell_v2");
         let shares_in = Self::core_trade(&env, &global.market_core, fn_name, args)?;
-        let p_after = client.get_price(&market_id, &outcome);
+        let p_after = core_call(client.try_get_price(&market_id, &outcome))?;
         if p_after.abs_diff(p_before) > prices.max_impact_bps {
             return Err(Error::PriceImpactExceeded);
         }
@@ -2827,8 +2899,9 @@ impl Treasury {
 
     /// Calls a market-core trade, catching its failure. market-core's
     /// `SlippageExceeded` becomes the treasury's own code (the bound is the
-    /// treasury's, and market-core's 12 would read as
-    /// `NetExposureExceeded`); every other failure is re-raised unchanged.
+    /// treasury's); every other failure is mapped into the treasury's
+    /// `MarketCore*` range so market-core's numeric codes never leak through
+    /// the treasury ABI.
     ///
     /// Invoked by name rather than through the generated client's `try_`
     /// methods: those decode into market-core's `Error` type, which would
@@ -2840,12 +2913,12 @@ impl Treasury {
             args,
         ) {
             Ok(Ok(value)) => Ok(value),
-            Ok(Err(_)) => Err(Error::InvalidAmount),
+            Ok(Err(_)) => Err(Error::MarketCoreCallFailed),
             Err(Ok(e)) if e == soroban_sdk::Error::from_contract_error(CORE_SLIPPAGE_EXCEEDED) => {
                 Err(Error::SlippageExceeded)
             }
-            Err(Ok(e)) => panic_with_error!(env, e),
-            Err(Err(_)) => panic!("market-core trade aborted"),
+            Err(Ok(e)) => Err(map_market_core_code(e)),
+            Err(Err(_)) => Err(Error::MarketCoreCallFailed),
         }
     }
 
@@ -3250,11 +3323,11 @@ impl Treasury {
 
     /// `(floor, spot)` value of the treasury's holdings in one market (see
     /// [`Valuation`]): two cross-contract reads.
-    fn holdings_value(env: &Env, core: &Address, market_id: u64) -> (i128, i128) {
+    fn holdings_value(env: &Env, core: &Address, market_id: u64) -> Result<(i128, i128), Error> {
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let market = client.get_market(&market_id);
-        let position = client.get_position(&market_id, &treasury_addr);
+        let market = core_call(client.try_get_market(&market_id))?;
+        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         let (lp_yes, lp_no) = if lp {
             (market.reserve_yes, market.reserve_no)
@@ -3262,7 +3335,7 @@ impl Treasury {
             (0, 0)
         };
 
-        match market.status {
+        Ok(match market.status {
             MarketStatus::Open => {
                 let floor = position
                     .yes
@@ -3291,7 +3364,7 @@ impl Treasury {
                     .saturating_add(Self::settle_value(&status, lp_yes, lp_no));
                 (settled, settled)
             }
-        }
+        })
     }
 
     fn compute_nav(env: &Env, global: &GlobalConfig) -> Result<i128, Error> {
@@ -3303,7 +3376,7 @@ impl Treasury {
                 .persistent()
                 .get(&key)
                 .ok_or(Error::NotInitialized)?;
-            let (floor, _) = Self::holdings_value(env, &entry.core, entry.market_id);
+            let (floor, _) = Self::holdings_value(env, &entry.core, entry.market_id)?;
             total = total.checked_add(floor).ok_or(Error::InvalidAmount)?;
         }
         Ok(total.saturating_sub(Self::reserved(env)).max(0))
@@ -3383,22 +3456,23 @@ impl Treasury {
 
     /// Drops `market_id` from the index once the treasury holds nothing in
     /// it: no shares and no unclaimed LP role.
-    fn prune_if_settled(env: &Env, core: &Address, market_id: u64) {
+    fn prune_if_settled(env: &Env, core: &Address, market_id: u64) -> Result<(), Error> {
         if !env
             .storage()
             .persistent()
             .has(&DataKey::OpenMarketSlot(core.clone(), market_id))
         {
-            return;
+            return Ok(());
         }
         let treasury_addr = env.current_contract_address();
         let client = MarketCoreClient::new(env, core);
-        let position = client.get_position(&market_id, &treasury_addr);
-        let market = client.get_market(&market_id);
+        let position = core_call(client.try_get_position(&market_id, &treasury_addr))?;
+        let market = core_call(client.try_get_market(&market_id))?;
         let lp = market.creator == treasury_addr && !market.lp_claimed;
         if position.yes == 0 && position.no == 0 && !lp {
             Self::index_remove(env, core, market_id);
         }
+        Ok(())
     }
 
     // ----- shares and queue ------------------------------------------------------------
@@ -5300,7 +5374,7 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
+    #[should_panic(expected = "Error(Contract, #2003)")]
     fn constructor_rejects_net_cap_below_max_trade() {
         fixture_with_net_cap(20 * USDC, 50 * USDC, 60 * USDC, 20 * USDC - 1);
     }
@@ -5793,13 +5867,13 @@ mod test {
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
+    #[should_panic(expected = "Error(Contract, #2003)")]
     fn constructor_invalid_caps_panics_with_contract_error_3() {
         fixture_with_caps(20 * USDC, 10 * USDC, 60 * USDC);
     }
 
     #[test]
-    #[should_panic(expected = "Error(Contract, #3)")]
+    #[should_panic(expected = "Error(Contract, #2003)")]
     fn constructor_rejects_config_delay_below_minimum() {
         let default_policy = CreationPolicy {
             max_seed: USDC,
