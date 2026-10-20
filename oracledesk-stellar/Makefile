@@ -1,4 +1,4 @@
-.PHONY: setup build test lint fmt deploy-testnet seed-market demo bindings clean
+.PHONY: setup build test lint fmt auth-matrix kani model-test e2e-local deploy-testnet seed-market demo bindings clean
 
 # Installs Node dependencies for the TypeScript packages. Rust toolchain,
 # the `stellar` CLI, and Python 3 are expected to already be on PATH — see
@@ -30,17 +30,37 @@ build:
 	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/router/reasoning_registry.wasm
 	cp target/wasm32v1-none/release/resolver.wasm contracts/treasury/resolver.wasm
 	stellar contract build
+	cp target/wasm32v1-none/release/market_core.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/resolver.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/treasury.wasm contracts/integration-tests/wasm/
+	cp target/wasm32v1-none/release/reasoning_registry.wasm contracts/integration-tests/wasm/
 
 test: build
 	cargo test --workspace
 	cargo test --manifest-path scripts/spec-hash/Cargo.toml
 	python3 model/fpmm_model.py
+	python3 model/system_model.py --selftest
 	cd x402 && npm test
 	cd agents && npm test
 
 lint:
+	./scripts/check-no-mock-all-auths.sh
 	cargo fmt --check
 	cargo clippy --workspace --all-targets -- -D warnings
+
+auth-matrix: build
+	cargo test -p integration-tests --test auth_matrix
+	./scripts/check-no-mock-all-auths.sh
+
+kani:
+	cargo kani -p market-core
+
+model-test:
+	python3 model/system_model.py --selftest
+	cargo test -p integration-tests --test system_model
+
+e2e-local:
+	./scripts/e2e-local.sh
 
 fmt:
 	cargo fmt

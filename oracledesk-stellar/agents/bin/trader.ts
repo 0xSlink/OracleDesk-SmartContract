@@ -24,10 +24,21 @@ import { agentCredentials, loadDeployments, StellarAdapter } from "../stellar/ad
 /** Placeholder in place of a real market read + reference-price lookup —
  * see docs/wave-issues for wiring get_market/get_price and a
  * ReferencePriceSource as open issues. */
-async function fetchMarketAndFairValue(): Promise<{ market: MarketState; fairValueBps: number }> {
+async function fetchMarketAndFairValue(
+  env: NodeJS.ProcessEnv = process.env,
+): Promise<{ market: MarketState; fairValueBps: number }> {
+  // The local E2E harness points this at a real seeded market. The defaults
+  // keep the dry-run demo deterministic.
   return {
-    market: { marketId: 0, question: "demo", yesBps: 4000, closeTime: Math.floor(Date.now() / 1000) + 3600 },
-    fairValueBps: 6000,
+    market: {
+      marketId: Number(env.TRADER_MARKET_ID ?? 0),
+      question: env.TRADER_MARKET_QUESTION ?? "demo",
+      yesBps: Number(env.TRADER_MARKET_YES_BPS ?? 4000),
+      closeTime:
+        Number(env.TRADER_MARKET_CLOSE_TIME ?? 0) ||
+        Math.floor(Date.now() / 1000) + 3600,
+    },
+    fairValueBps: Number(env.TRADER_FAIR_VALUE_BPS ?? 6000),
   };
 }
 
@@ -43,7 +54,7 @@ export async function main(
   const traceStore = new LocalTraceStore(env.TRACE_STORE_DIR ?? "./.traces");
 
   console.log(`[trader] mode=${adapter.mode}`);
-  const { market, fairValueBps } = await fetchMarketAndFairValue();
+  const { market, fairValueBps } = await fetchMarketAndFairValue(env);
   const decision = decideTrade(market, fairValueBps, {
     minEdgeBps: Number(env.MIN_EDGE_BPS ?? 500),
     tradeSizeStroops: BigInt(env.TRADE_SIZE_STROOPS ?? "100000000"),

@@ -25,6 +25,7 @@ async function main() {
     repository: await buildRepository(),
     ipfsGateway: process.env.IPFS_GATEWAY_URL ?? "https://ipfs.io/ipfs",
     price: process.env.TRACE_PRICE_USDC ?? "0.01",
+    paymentsDisabled: process.env.PAYMENTS_DISABLED === "1",
     networks: [
       ...(process.env.TESTNET_SERVER_STELLAR_ADDRESS && process.env.TESTNET_FACILITATOR_URL
         ? [{
