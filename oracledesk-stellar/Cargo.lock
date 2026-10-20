@@ -1235,6 +1235,7 @@ name = "market-core"
 version = "0.1.0"
 dependencies = [
  "ed25519-dalek",
+ "serde_json",
  "soroban-sdk",
 ]
 
